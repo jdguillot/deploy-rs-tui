@@ -10,7 +10,7 @@ name = "deploy-rs-tui"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.28"
+ratatui = { version = "0.28", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"

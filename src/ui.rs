@@ -49,25 +49,59 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Vertical layout, top → bottom:
     //   1. title bar
-    //   2. toggles strip — bordered block (3 rows)
+    //   2. toggles strip — bordered block (3 or 4 rows — see below)
     //   3. body (hosts | details | job log)
-    //   4. commands pane — bordered block (3 rows), split horizontally
-    //      into an info-hints half (left) and a navigable command
-    //      button row (right)
+    //   4. commands pane — bordered block (3 or 4 rows), split
+    //      horizontally into an info-hints half (left) and a
+    //      navigable command button row (right). The info half is
+    //      context-aware: it re-renders its hint list based on the
+    //      currently focused pane, so j/k mean different things in
+    //      Hosts vs Details and the cheat-sheet follows.
     //   5. input prompt strip — only present (1 row) when an
     //      override/confirm input mode is active. In Normal mode the
     //      row collapses to 0 so the bottom edge of the commands box
     //      sits flush with the terminal border instead of leaving an
     //      empty gap.
+    //
+    // **Adaptive height.** The toggles/commands strips normally sit
+    // at 3 rows (1 inner). On narrow terminals — or when the context
+    // info line gets long — a single inner row can't fit the whole
+    // content. Instead of truncating, we bump the relevant strip to
+    // 4 rows (2 inner) and let ratatui's `Wrap` split the spans
+    // across the two lines. Measurement below is pessimistic (adds a
+    // small fudge for the leading space + trailing margin) so we
+    // always bump *before* the content actually gets clipped.
     let needs_input_strip = !matches!(app.input, InputMode::Normal);
     let input_strip_height = if needs_input_strip { 1 } else { 0 };
+
+    // Toggles: single-row content, full width minus borders.
+    let toggles_content_w = toggles_content_width();
+    let toggles_inner_w = area.width.saturating_sub(2) as usize;
+    let toggles_height: u16 = if toggles_content_w > toggles_inner_w { 4 } else { 3 };
+
+    // Commands row: two-column layout (40/60). Measure info +
+    // commands independently and bump the whole strip if *either*
+    // side overflows its column.
+    let info_col_w = (area.width as usize * 40) / 100;
+    let cmd_col_w = area.width as usize - info_col_w;
+    let info_inner_w = info_col_w.saturating_sub(2);
+    let cmd_inner_w = cmd_col_w.saturating_sub(2);
+    let info_content_w = info_content_width(app);
+    let cmd_content_w = commands_content_width();
+    let commands_height: u16 =
+        if info_content_w > info_inner_w || cmd_content_w > cmd_inner_w {
+            4
+        } else {
+            3
+        };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(toggles_height),
             Constraint::Min(5),
-            Constraint::Length(3),
+            Constraint::Length(commands_height),
             Constraint::Length(input_strip_height),
         ])
         .split(area);
@@ -286,7 +320,12 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
         format!(" [{} marked] ", app.marked.len())
     };
     let focused = app.focus == FocusPane::Hosts;
-    let mut title_spans = pane_title_spans("hosts", 'g', focused);
+    // `g` was repurposed to "scroll to top" across every pane, so the
+    // hosts jump letter is `f` (focus hosts) — the obvious `h` is
+    // already the home-profile shortcut and `n` owns search-next.
+    // We inject `f` manually (instead of letting pane_title_spans
+    // find it in the label) so the bracket sits before the word.
+    let mut title_spans = pane_title_spans("fhosts", 'f', focused);
     if !count_label.is_empty() {
         title_spans.push(Span::styled(
             count_label,
@@ -304,23 +343,25 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(list, area);
 }
 
-/// Border colour for a pane that can hold focus: bright cyan when the
-/// pane owns the keyboard, default otherwise. This is the main visual
-/// cue — a bolded title alone was too easy to miss.
+/// Border colour for a pane that can hold focus: magenta when the
+/// pane owns the keyboard, default otherwise. Shares the colour
+/// with the override chips/input strip so "this thing is active /
+/// interactive" is one consistent visual cue across the UI.
 fn focus_border_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(Color::Yellow)
     } else {
         Style::default()
     }
 }
 
-/// Title styling that matches the border. Focused = bold cyan,
-/// otherwise the terminal default.
+/// Title styling that matches the border. Focused = bold yellow
+/// (same hue as the `[k]` hot-letter backgrounds so the focused pane
+/// visually "owns" its jump key), otherwise the terminal default.
 fn focus_title_style(focused: bool) -> Style {
     if focused {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
@@ -420,7 +461,8 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &mut App) {
     if let (Some(q), Some(crate::app::SearchTarget::DetailsLog)) =
         (app.log_search.as_ref(), app.log_search_target)
     {
-        title_spans.push(search_chip(q));
+        let (cur, total) = app.log_search_stats(crate::app::SearchTarget::DetailsLog);
+        title_spans.push(search_chip(q, cur, total));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -846,13 +888,23 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == FocusPane::JobLog;
     // Pane title gets a `[/query]` chip when a job-log search is
     // active so the user can see what they're filtering on without
-    // looking at the input strip.
+    // looking at the input strip, plus a `[↑N]` chip when the user
+    // has scrolled back from the tail.
     let mut title_spans = pane_title_spans("job log", 'v', focused);
     if let (Some(q), Some(crate::app::SearchTarget::JobLog)) =
         (app.log_search.as_ref(), app.log_search_target)
     {
-        title_spans.push(search_chip(q));
+        let (cur, total) = app.log_search_stats(crate::app::SearchTarget::JobLog);
+        title_spans.push(search_chip(q, cur, total));
     }
+    if app.job_log_scroll > 0 {
+        title_spans.push(scroll_chip(app.job_log_scroll));
+    }
+
+    let width = job_log_prefix_width(app);
+    let tagged: Vec<&crate::app::LogEntry> =
+        app.log.iter().filter(|e| e.host.is_some()).collect();
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(focus_border_style(focused))
@@ -860,9 +912,6 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let width = job_log_prefix_width(app);
-    let tagged: Vec<&crate::app::LogEntry> =
-        app.log.iter().filter(|e| e.host.is_some()).collect();
     if tagged.is_empty() {
         let empty = Line::styled(
             " (no deploy output yet — press s / b / d to start)",
@@ -872,55 +921,98 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    // Independent scroll: job_log_scroll pins the view N lines back
-    // from the tail. We clamp against the rendered visible height in
-    // place — i.e. the value the user holds in `app.job_log_scroll`
-    // is itself capped at `max_scroll`, not just the displayed copy.
-    // Without this, holding `k` past the top would accumulate
-    // phantom offset that the user then has to grind back through
-    // with `j`.
-    let height = inner.height as usize;
+    // Clamp entry-based scroll so holding `k` past the oldest entry
+    // doesn't accumulate phantom offset that later has to be unwound
+    // with `j`. The max is "all but one entry scrolled off" because
+    // wrapping makes a strict row-anchored max hard to compute here
+    // — `scroll = total - 1` guarantees the oldest entry is still
+    // reachable from the current row offset.
     let total = tagged.len();
-    let max_scroll = total.saturating_sub(height);
-    if app.job_log_scroll > max_scroll {
-        app.job_log_scroll = max_scroll;
+    let max_entry_scroll = total.saturating_sub(1);
+    if app.job_log_scroll > max_entry_scroll {
+        app.job_log_scroll = max_entry_scroll;
     }
     let scroll = app.job_log_scroll;
-    let end = total.saturating_sub(scroll);
-    let start = end.saturating_sub(height);
 
-    // The active search query (if any and pinned to this pane).
     let query = if matches!(app.log_search_target, Some(crate::app::SearchTarget::JobLog)) {
         app.log_search.as_deref()
     } else {
         None
     };
 
-    let mut lines: Vec<Line> = Vec::with_capacity(end.saturating_sub(start) + 1);
-    if scroll > 0 {
-        lines.push(scrolled_back_indicator(scroll));
-    }
-    for entry in &tagged[start..end] {
-        let host = entry.host.as_deref().unwrap_or("");
-        let pad = width.saturating_sub(host.len());
-        let color = job_log_color(host);
-        let prefix = format!("{host}{} │ ", " ".repeat(pad));
-        let body_style = if entry.is_err {
-            Style::default().fg(Color::Red)
-        } else {
-            Style::default()
-        };
-        let mut spans = vec![Span::styled(
-            prefix,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )];
-        spans.extend(highlight_match(&entry.text, query, body_style));
-        lines.push(Line::from(spans));
-    }
+    // Build every filtered line up-front. Rendering the full set (and
+    // scrolling into it) is what fixes the wrap-clip bug: the earlier
+    // version picked `height` entries and let Paragraph clip the
+    // overflow from the bottom, so long `[pkg] listing …` lines would
+    // push the tail off-screen even with `scroll == 0`.
+    let all_lines: Vec<Line> = tagged
+        .iter()
+        .map(|entry| {
+            let host = entry.host.as_deref().unwrap_or("");
+            let pad = width.saturating_sub(host.len());
+            let color = job_log_color(host);
+            let prefix = format!("{host}{} │ ", " ".repeat(pad));
+            let body_style = if entry.is_err {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default()
+            };
+            let mut spans = vec![Span::styled(
+                prefix,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )];
+            spans.extend(highlight_match(&entry.text, query, body_style));
+            Line::from(spans)
+        })
+        .collect();
+
+    let visible = inner.height as usize;
+    let (y_offset, _max_row_offset) =
+        compute_tail_scroll_offset(&all_lines, scroll, inner.width, visible);
+
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Paragraph::new(all_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((y_offset, 0)),
         inner,
     );
+}
+
+/// Turn an *entry-based* scroll offset into a *row-based* paragraph
+/// scroll offset so wrapped content anchors against the bottom of
+/// `inner`. Shared by both log panes. Returns `(y_offset, max_row_offset)`
+/// — the second component is handed back so the caller can clamp user
+/// state against it if desired.
+///
+/// The trick: we measure the total wrapped-row count of the full
+/// line list via `Paragraph::line_count(width)`, and also measure
+/// how many rows the "scrolled-off" tail entries would occupy (the
+/// last `scroll` entries). Subtracting both from `max_row_offset`
+/// gives a paragraph-scroll value that places the tail flush with
+/// the bottom edge when `scroll == 0`.
+fn compute_tail_scroll_offset(
+    all_lines: &[Line<'_>],
+    scroll: usize,
+    width: u16,
+    visible: usize,
+) -> (u16, usize) {
+    if all_lines.is_empty() || width == 0 {
+        return (0, 0);
+    }
+    let total_rows = Paragraph::new(all_lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .line_count(width);
+    let max_row_offset = total_rows.saturating_sub(visible);
+    let row_scroll = if scroll == 0 {
+        0
+    } else {
+        let tail_start = all_lines.len().saturating_sub(scroll);
+        Paragraph::new(all_lines[tail_start..].to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+    };
+    let y = max_row_offset.saturating_sub(row_scroll);
+    (y.min(u16::MAX as usize) as u16, max_row_offset)
 }
 
 fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -942,19 +1034,17 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    // Clamp `log_scroll` in place against the rendered visible
-    // height. Same rationale as `draw_job_log` — without this,
-    // holding `k` past the top of the buffer accumulates phantom
-    // offset that has to be unwound with `j`.
-    let height = area.height as usize;
+    // Clamp entry-based scroll against an entry-count cap so holding
+    // `k` past the oldest entry doesn't accumulate phantom offset —
+    // same rationale as `draw_job_log`. The row-count math for the
+    // actual bottom-anchored offset happens below in
+    // `compute_tail_scroll_offset`.
     let total = filtered.len();
-    let max_scroll = total.saturating_sub(height);
-    if app.log_scroll > max_scroll {
-        app.log_scroll = max_scroll;
+    let max_entry_scroll = total.saturating_sub(1);
+    if app.log_scroll > max_entry_scroll {
+        app.log_scroll = max_entry_scroll;
     }
     let scroll = app.log_scroll;
-    let end = total.saturating_sub(scroll);
-    let start = end.saturating_sub(height);
     let query = if matches!(
         app.log_search_target,
         Some(crate::app::SearchTarget::DetailsLog)
@@ -963,19 +1053,34 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         None
     };
-    let mut lines: Vec<Line> = Vec::with_capacity(end.saturating_sub(start) + 1);
-    if scroll > 0 {
-        lines.push(scrolled_back_indicator(scroll));
+    if filtered.is_empty() {
+        return;
     }
-    for entry in &filtered[start..end] {
-        let style = if entry.is_err {
-            Style::default().fg(Color::Red)
-        } else {
-            Style::default()
-        };
-        lines.push(Line::from(highlight_match(&entry.text, query, style)));
-    }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    // Build every line up-front so we can render the full paragraph
+    // and use row-exact scroll. Picking `height` entries by count and
+    // letting the Paragraph clip the overflow was dropping the tail
+    // whenever long `[pkg] listing …` lines wrapped, so the details
+    // log was missing its newest rows despite `scroll == 0`.
+    let all_lines: Vec<Line> = filtered
+        .iter()
+        .map(|entry| {
+            let style = if entry.is_err {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default()
+            };
+            Line::from(highlight_match(&entry.text, query, style))
+        })
+        .collect();
+    let visible = area.height as usize;
+    let (y_offset, _max_row_offset) =
+        compute_tail_scroll_offset(&all_lines, scroll, area.width, visible);
+    frame.render_widget(
+        Paragraph::new(all_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((y_offset, 0)),
+        area,
+    );
 }
 
 /// Split `text` into spans, highlighting every occurrence of `query`
@@ -991,7 +1096,7 @@ fn highlight_match(
         return vec![Span::styled(text.to_string(), base_style)];
     };
     let hi = base_style
-        .bg(Color::Yellow)
+        .bg(Color::Magenta)
         .fg(Color::Black)
         .add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
@@ -1011,12 +1116,15 @@ fn highlight_match(
     spans
 }
 
-/// Pane-title chip rendered next to a log pane label when that pane
-/// has an active committed search query. Compact so it doesn't push
-/// the title off the right edge of narrow terminals.
-fn search_chip(query: &str) -> Span<'static> {
+/// Pane-title chip rendered next to a log pane label when the user
+/// has scrolled back from the tail. Replaces the in-log "scrolled ↑N"
+/// banner that used to sit at the top of the visible window —
+/// rendering that banner inside the paragraph confused the row-exact
+/// tail anchoring, so it moved to the title instead. The yellow
+/// background matches the focused-pane palette.
+fn scroll_chip(scroll: usize) -> Span<'static> {
     Span::styled(
-        format!("[/{}] ", query),
+        format!("[↑{scroll}] "),
         Style::default()
             .fg(Color::Black)
             .bg(Color::Yellow)
@@ -1024,30 +1132,28 @@ fn search_chip(query: &str) -> Span<'static> {
     )
 }
 
-/// Render the "scrolled back N lines" banner that sits at the top of
-/// a scroll-back log pane. Includes the key reminders for resuming
-/// follow (Shift+G snaps to tail) and jumping to top (g focuses
-/// hosts — there's no "top of log" key, so we just remind about
-/// follow). Used by both the details log and the job log so the hint
-/// stays consistent.
-fn scrolled_back_indicator(scroll: usize) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("  -- scrolled ↑{scroll} -- "),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("Shift+G", Style::default().fg(Color::Yellow)),
-        Span::styled(
-            " follow",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ])
+/// Pane-title chip rendered next to a log pane label when that pane
+/// has an active committed search query. Includes `[current/total]`
+/// match counters when any match exists in the filtered view, so the
+/// user can see at a glance whether `n`/`Shift+N` will actually move
+/// them anywhere. Compact so it doesn't push the title off the right
+/// edge of narrow terminals.
+fn search_chip(query: &str, current: usize, total: usize) -> Span<'static> {
+    let label = if total > 0 {
+        format!("[/{} {}/{}] ", query, current, total)
+    } else {
+        format!("[/{} 0/0] ", query)
+    };
+    Span::styled(
+        label,
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 fn draw_toggles_strip(frame: &mut Frame, area: Rect, app: &App) {
-    let t = app.toggles;
     let focused = app.focus == FocusPane::Toggles;
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1055,7 +1161,21 @@ fn draw_toggles_strip(frame: &mut Frame, area: Rect, app: &App) {
         .title(Line::from(pane_title_spans("toggles", 't', focused)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let spans = build_toggles_spans(app, focused);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
 
+/// Build the full span list for the toggles strip. Pulled out of
+/// `draw_toggles_strip` so `toggles_content_width` can measure the
+/// exact same content the renderer is about to draw — otherwise the
+/// adaptive-height decision in `draw()` could disagree with what
+/// actually gets rendered and bump the strip to 2 inner lines for
+/// content that fits on one (or vice versa).
+fn build_toggles_spans(app: &App, focused: bool) -> Vec<Span<'static>> {
+    let t = app.toggles;
     // When the toggles pane has focus, the currently-navigated toggle
     // gets a reverse-video highlight so the user knows which one
     // Enter will flip.
@@ -1076,7 +1196,22 @@ fn draw_toggles_strip(frame: &mut Frame, area: Rect, app: &App) {
         }
         spans.push(toggle_span(key, label, *on, sub == Some(i)));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+    spans
+}
+
+/// Rendered width (in display columns) of the toggles strip content.
+/// We ignore focus-dependent styling because the widths are the same
+/// with or without focus — only the colours change.
+fn toggles_content_width() -> usize {
+    // Values deliberately match `build_toggles_spans`'s label list;
+    // if a label ever grows here, bump it there too.
+    let labels = ["skip-checks", "magic-rb", "auto-rb", "remote-build", "int-sudo"];
+    // Each toggle renders as ` <key>:<icon> <label> ` = 6 fixed chars
+    // + label; plus a 2-char separator between toggles and a leading
+    // space.
+    let per_toggle: usize = labels.iter().map(|l| 6 + l.len()).sum();
+    let separators = 2 * (labels.len() - 1);
+    1 + per_toggle + separators
 }
 
 fn toggle_span(key: &str, label: &str, on: bool, focused: bool) -> Span<'static> {
@@ -1107,6 +1242,11 @@ fn toggle_span(key: &str, label: &str, on: bool, focused: bool) -> Span<'static>
 /// commands holds the per-action buttons. Each half borders and
 /// titles independently so focus lights up the commands pane without
 /// lighting up the info pane.
+///
+/// The info column is **context-aware**: its hint list changes based
+/// on `app.focus`, so `j/k` in Hosts says "move selection" while in
+/// Details it says "scroll" and surfaces `g/G` and `/` instead. This
+/// mirrors the way the pane-specific keys actually behave.
 fn draw_commands_row(frame: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -1117,23 +1257,11 @@ fn draw_commands_row(frame: &mut Frame, area: Rect, app: &App) {
     let info_block = Block::default().borders(Borders::ALL).title(" info ");
     let info_inner = info_block.inner(cols[0]);
     frame.render_widget(info_block, cols[0]);
-    let yellow = Style::default().fg(Color::Yellow);
-    let info = Line::from(vec![
-        Span::raw(" "),
-        Span::styled("j/k", yellow),
-        Span::raw(" move  "),
-        Span::styled("Space", yellow),
-        Span::raw(" mark  "),
-        Span::styled("Tab", yellow),
-        Span::raw(" focus  "),
-        Span::styled("1-5", yellow),
-        Span::raw(" toggles  "),
-        Span::styled("?", yellow),
-        Span::raw(" help  "),
-        Span::styled("q", yellow),
-        Span::raw(" quit"),
-    ]);
-    frame.render_widget(Paragraph::new(info), info_inner);
+    let info_spans = build_info_spans(app);
+    frame.render_widget(
+        Paragraph::new(Line::from(info_spans)).wrap(Wrap { trim: false }),
+        info_inner,
+    );
 
     // Right: navigable command buttons.
     let focused = app.focus == FocusPane::Commands;
@@ -1144,6 +1272,109 @@ fn draw_commands_row(frame: &mut Frame, area: Rect, app: &App) {
     let cmd_inner = cmd_block.inner(cols[1]);
     frame.render_widget(cmd_block, cols[1]);
 
+    let spans = build_commands_spans(app, focused);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
+        cmd_inner,
+    );
+}
+
+/// Build the info-column hint spans for whichever pane currently has
+/// focus. Each variant returns a `(key, description)` list rendered
+/// the same way (yellow key + plain description), keeping the visual
+/// style consistent no matter what's focused.
+///
+/// Kept paired with `info_content_width` below — if you add or
+/// remove a hint here, the measurement function needs to match or
+/// the adaptive-height decision in `draw()` will disagree with the
+/// actual rendered width.
+fn build_info_spans(app: &App) -> Vec<Span<'static>> {
+    let hints: Vec<(&'static str, &'static str)> = info_hints_for(app);
+    let yellow = Style::default().fg(Color::Yellow);
+    let mut spans = Vec::with_capacity(hints.len() * 3 + 1);
+    spans.push(Span::raw(" "));
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(*key, yellow));
+        spans.push(Span::raw(format!(" {desc}")));
+    }
+    spans
+}
+
+/// The list of `(key, description)` pairs for the focused pane.
+/// Pulled out of `build_info_spans` so both the renderer and the
+/// width-measurer walk the exact same list.
+fn info_hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
+    let search_active_here = match (app.focus, app.log_search_target, &app.log_search) {
+        (FocusPane::Details, Some(crate::app::SearchTarget::DetailsLog), Some(_)) => true,
+        (FocusPane::JobLog, Some(crate::app::SearchTarget::JobLog), Some(_)) => true,
+        _ => false,
+    };
+    match app.focus {
+        FocusPane::Hosts => vec![
+            ("j/k", "move"),
+            ("Space", "mark"),
+            ("g/G", "top/bottom"),
+            ("Tab", "focus"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        FocusPane::Details | FocusPane::JobLog => {
+            let mut v: Vec<(&'static str, &'static str)> = vec![
+                ("j/k", "scroll"),
+                ("g/G", "top/tail"),
+                ("/", "search"),
+            ];
+            if search_active_here {
+                v.push(("n/N", "next/prev"));
+                v.push(("Esc", "clear"));
+            }
+            v.push(("Tab", "focus"));
+            v.push(("?", "help"));
+            v.push(("q", "quit"));
+            v
+        }
+        FocusPane::Toggles => vec![
+            ("h/l", "move"),
+            ("Enter", "flip"),
+            ("1-5", "direct"),
+            ("Tab", "focus"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        FocusPane::Commands => vec![
+            ("h/l", "move"),
+            ("Enter", "run"),
+            ("Tab", "focus"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+    }
+}
+
+/// Rendered width (in display columns) of the context-aware info
+/// line for the currently focused pane. Mirrors the formatting in
+/// `build_info_spans`: 1 leading space, then for each hint a
+/// 2-char separator (after the first), the key, a space, and the
+/// description.
+fn info_content_width(app: &App) -> usize {
+    let hints = info_hints_for(app);
+    let mut w = 1; // leading space
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        if i > 0 {
+            w += 2; // "  " separator
+        }
+        w += key.len() + 1 + desc.len();
+    }
+    w
+}
+
+/// Build the right-hand commands button row. Pulled out of
+/// `draw_commands_row` for the same width-measurement reason as
+/// `build_toggles_spans`.
+fn build_commands_spans(app: &App, focused: bool) -> Vec<Span<'static>> {
     let sub = if focused { Some(app.command_index) } else { None };
     let mut spans: Vec<Span> = Vec::with_capacity(COMMANDS.len() * 3 + 1);
     spans.push(Span::raw(" "));
@@ -1153,7 +1384,20 @@ fn draw_commands_row(frame: &mut Frame, area: Rect, app: &App) {
         }
         spans.extend(command_button(key, label, sub == Some(i)));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), cmd_inner);
+    spans
+}
+
+/// Rendered width of the commands-button row. `command_button`
+/// always emits `" <key>:<label> "` = 3 fixed chars + key + label,
+/// separated by a single space between buttons, with one leading
+/// space.
+fn commands_content_width() -> usize {
+    let per_button: usize = COMMANDS
+        .iter()
+        .map(|(_cmd, key, label)| 3 + key.len() + label.len())
+        .sum();
+    let separators = COMMANDS.len().saturating_sub(1); // 1-char spaces
+    1 + per_button + separators
 }
 
 /// Two-span command button: the key in yellow (same colour as the
@@ -1289,12 +1533,12 @@ fn draw_input_strip(frame: &mut Frame, area: Rect, app: &App) {
                     label,
                     Style::default()
                         .fg(Color::Black)
-                        .bg(Color::Cyan)
+                        .bg(Color::Magenta)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
                 Span::raw(buf.clone()),
-                Span::styled("▎", Style::default().fg(Color::Cyan)),
+                Span::styled("▎", Style::default().fg(Color::Magenta)),
                 Span::raw("   "),
                 Span::styled("Enter", Style::default().fg(Color::Yellow)),
                 Span::raw(" commit  "),
@@ -1307,12 +1551,12 @@ fn draw_input_strip(frame: &mut Frame, area: Rect, app: &App) {
                 " /filter help ▸ ",
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .bg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             Span::raw(buf.clone()),
-            Span::styled("▎", Style::default().fg(Color::Cyan)),
+            Span::styled("▎", Style::default().fg(Color::Magenta)),
             Span::raw("   "),
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
             Span::raw(" commit  "),
@@ -1369,9 +1613,13 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         key_line("Shift+↑/↓", "same as Shift+J/K"),
         key_line("Tab", "cycle focus forward (toggles → hosts → details → joblog → commands)"),
         key_line("Shift+Tab", "cycle focus backward"),
-        key_line("g/i/v/t/c", "btop-style jump: (g)hosts, (i)nfo details, (v)iew job log, (t)oggles, (c)ommands"),
+        key_line("f/i/v/t/c", "btop-style jump: (f)ocus hosts, (i)nfo details, (v)iew job log, (t)oggles, (c)ommands"),
         key_line("Enter", "activate the focused toggle or command button"),
-        key_line("Shift+G", "snap details/job-log scroll back to the tail (resume follow)"),
+        key_line(
+            "g",
+            "vim-style 'go to top' — hosts=first host, details/joblog=oldest line, help=top",
+        ),
+        key_line("Shift+G", "vim-style 'go to bottom' — details/joblog snap to tail, help=bottom"),
         key_line("q", "quit (Esc closes popups/edits but never quits)"),
         key_line("Ctrl-C", "quit and kill any running deploy"),
         Line::raw(""),
@@ -1387,7 +1635,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         ),
         key_line(
             "Esc",
-            "while searching: clear the query and exit the prompt",
+            "in log pane: clear the committed search. While typing: abort the prompt.",
         ),
         Line::raw(""),
 

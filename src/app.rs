@@ -513,9 +513,10 @@ impl App {
                     self.help_scroll = self.help_scroll.saturating_sub(5);
                 }
                 KeyCode::Home => self.help_scroll = 0,
-                // Vim-style "G" snaps to the bottom of the popup. We
-                // can't know the rendered height here so we set a big
-                // value; the renderer clamps it.
+                // Vim-style "g" → top of the popup, "G" → bottom.
+                // The renderer clamps `u16::MAX` against the rendered
+                // content height in-place.
+                KeyCode::Char('g') => self.help_scroll = 0,
                 KeyCode::Char('G') => self.help_scroll = u16::MAX,
                 _ => {}
             }
@@ -655,13 +656,22 @@ impl App {
             // Modal handlers (override / confirm / identity picker)
             // still consume Esc to back out themselves.
             KeyCode::Esc => return,
-            // btop-style direct pane jumps. Picked letters that don't
-            // collide with anything else: `g` = go-to hosts (vim `gg`
-            // analogy), `i` = inspect details, `v` = view job log,
-            // `t` = toggles, `c` = commands. The previous h/d/l
-            // choices clashed with home profile, dry-run, and vim
-            // sub-cursor motion.
+            // Vim-style "g" → scroll/jump to the top of whatever the
+            // focused pane is showing. This used to be a direct-jump
+            // to the Hosts pane; it got repurposed because `gg`/`G`
+            // for top/bottom is more useful on the log panes and the
+            // user reaches Hosts via Tab/Shift+H anyway. `G` snaps
+            // to the tail (handled in the shift block above).
             KeyCode::Char('g') => {
+                self.jump_to_top();
+                return;
+            }
+            // btop-style direct pane jumps. Picked letters that don't
+            // collide with anything else: `f` = focus hosts (the
+            // obvious `h` is taken by the home-profile shortcut and
+            // `n` is taken by search-next), `i` = inspect details,
+            // `v` = view job log, `t` = toggles, `c` = commands.
+            KeyCode::Char('f') => {
                 self.focus = FocusPane::Hosts;
                 return;
             }
@@ -726,6 +736,16 @@ impl App {
                     };
                     return;
                 }
+                // Esc clears an active search pinned to this pane so
+                // the highlights and chip disappear. Falls through to
+                // the global Esc no-op when no search is live.
+                KeyCode::Esc
+                    if matches!(self.log_search_target, Some(SearchTarget::DetailsLog))
+                        && self.log_search.is_some() =>
+                {
+                    self.clear_log_search();
+                    return;
+                }
                 // `n` / `Shift+N` navigate matches once a search has
                 // been committed for *this* pane. Until then they fall
                 // through to the global action keys below (where they
@@ -761,6 +781,15 @@ impl App {
                         target: SearchTarget::JobLog,
                         buf: String::new(),
                     };
+                    return;
+                }
+                // Esc clears an active search pinned to this pane.
+                // See the matching arm in FocusPane::Details for why.
+                KeyCode::Esc
+                    if matches!(self.log_search_target, Some(SearchTarget::JobLog))
+                        && self.log_search.is_some() =>
+                {
+                    self.clear_log_search();
                     return;
                 }
                 KeyCode::Char('n')
@@ -881,24 +910,30 @@ impl App {
     /// Horizontal pane move — only meaningful in the middle row where
     /// Hosts / Details / JobLog sit side by side. From Toggles or
     /// Commands this is a no-op because those panes don't have a
-    /// horizontal sibling.
+    /// horizontal sibling. Movement is **clamped** at both ends: from
+    /// JobLog going right is a no-op (not a wrap to Hosts), and from
+    /// Hosts going left is a no-op. The user specifically asked for
+    /// this so a stray Shift+L while reading the job log doesn't
+    /// teleport them back to the host list. Tab/Shift+Tab still wrap
+    /// for cycling.
     fn pane_move_horizontal(&mut self, delta: i32) {
         let order = [FocusPane::Hosts, FocusPane::Details, FocusPane::JobLog];
         let Some(pos) = order.iter().position(|p| *p == self.focus) else {
             // Not in row 2 — nothing to move to.
             return;
         };
-        let len = order.len() as i32;
-        let next = (pos as i32 + delta).rem_euclid(len) as usize;
+        let next = (pos as i32 + delta).clamp(0, order.len() as i32 - 1) as usize;
         self.focus = order[next];
     }
 
-    /// Vertical pane move — jumps between rows: Toggles (row 1) →
-    /// middle row → Commands (row 3). When crossing into the middle
+    /// Vertical pane move — jumps between rows: Toggles (row 0) →
+    /// middle row (row 1) → Commands (row 2). Clamped at both ends
+    /// like `pane_move_horizontal` so pressing Shift+J from Commands
+    /// doesn't wrap back to Toggles. When crossing into the middle
     /// row, lands on Hosts by default.
     fn pane_move_vertical(&mut self, delta: i32) {
         let row = self.focus.row() as i32;
-        let next_row = (row + delta).rem_euclid(3);
+        let next_row = (row + delta).clamp(0, 2);
         self.focus = match next_row {
             0 => FocusPane::Toggles,
             1 => FocusPane::Hosts,
@@ -1401,6 +1436,52 @@ impl App {
         }
     }
 
+    /// Drop the committed log search. Leaves the scroll positions
+    /// alone so the user stays where they were when they pressed Esc.
+    fn clear_log_search(&mut self) {
+        self.log_search = None;
+        self.log_search_target = None;
+    }
+
+    /// Return `(current, total)` match counts for a committed log
+    /// search on `target`. `current` is the 1-based index of the
+    /// last match at or before the pane's current cursor position;
+    /// `0` means the cursor sits above the first match (no match
+    /// behind the view yet). `total` is the full count across the
+    /// pane's filtered view. Returns `(0, 0)` when no search is
+    /// active for `target`.
+    pub fn log_search_stats(&self, target: SearchTarget) -> (usize, usize) {
+        let Some(query) = self.log_search.as_ref() else {
+            return (0, 0);
+        };
+        if self.log_search_target != Some(target) {
+            return (0, 0);
+        }
+        let (filtered, scroll) = match target {
+            SearchTarget::DetailsLog => {
+                (self.filtered_log_indices_for_details(), self.log_scroll)
+            }
+            SearchTarget::JobLog => {
+                (self.filtered_log_indices_for_job_log(), self.job_log_scroll)
+            }
+        };
+        if filtered.is_empty() {
+            return (0, 0);
+        }
+        let cursor = filtered.len().saturating_sub(1).saturating_sub(scroll);
+        let mut total = 0usize;
+        let mut current = 0usize;
+        for (i, &idx) in filtered.iter().enumerate() {
+            if self.log[idx].text.contains(query) {
+                total += 1;
+                if i <= cursor {
+                    current = total;
+                }
+            }
+        }
+        (current, total)
+    }
+
     /// Indices into `self.log` that the details pane currently shows
     /// for the highlighted host. Mirrors the filter inside `draw_log`
     /// in `ui.rs` so search and rendering agree.
@@ -1502,6 +1583,34 @@ impl App {
         self.job_log_scroll = next.min(tagged.saturating_sub(1));
     }
 
+    /// Vim-style "gg": jump to the top of whatever the focused pane
+    /// is showing. For scroll panes "top" means the oldest line in
+    /// the buffer (i.e. the maximum scroll-back offset); the renderer
+    /// clamps the value against the real buffer length so over-
+    /// shooting here is fine. For list panes it moves the cursor to
+    /// the first entry. Every focus variant is handled explicitly so
+    /// a new pane can't silently skip "g".
+    fn jump_to_top(&mut self) {
+        match self.focus {
+            FocusPane::Hosts => {
+                if !self.nodes.is_empty() {
+                    self.selected = 0;
+                }
+            }
+            FocusPane::Details => {
+                // Hard cap is `log.len() - 1`; renderer clamps against
+                // the visible height on top of that.
+                self.log_scroll = self.log.len().saturating_sub(1);
+            }
+            FocusPane::JobLog => {
+                let tagged = self.log.iter().filter(|e| e.host.is_some()).count();
+                self.job_log_scroll = tagged.saturating_sub(1);
+            }
+            FocusPane::Toggles => self.toggle_index = 0,
+            FocusPane::Commands => self.command_index = 0,
+        }
+    }
+
     /// Snap whichever scroll pane currently has focus back to its
     /// tail (offset 0). The Details and Job Log panes both maintain
     /// their own offset; outside those panes this is a no-op.
@@ -1567,10 +1676,33 @@ impl App {
     /// available profiles. Always populates the cheap-tier details
     /// (paths + activation time) as a byproduct; medium/expensive
     /// tiers live behind `U` and `p`.
+    /// Resolve which hosts a per-host command (updates / sizes / pkg
+    /// diff) should target. Mirrors the "marked wins over cursor"
+    /// semantics that `request_deploy` uses so all per-host actions
+    /// behave consistently: mark multiple and one keypress hits all
+    /// of them.
+    fn target_nodes(&self) -> Vec<Node> {
+        if self.marked.is_empty() {
+            self.selected_node().cloned().into_iter().collect()
+        } else {
+            self.marked
+                .iter()
+                .filter_map(|name| self.nodes.iter().find(|n| &n.name == name).cloned())
+                .collect()
+        }
+    }
+
     fn refresh_updates_for_selected(&mut self) {
-        let Some(node) = self.selected_node().cloned() else {
+        let targets = self.target_nodes();
+        if targets.is_empty() {
             return;
-        };
+        }
+        for node in targets {
+            self.refresh_updates_for_node(&node);
+        }
+    }
+
+    fn refresh_updates_for_node(&mut self, node: &Node) {
         // Mark every probe in flight *before* spawning so the UI flips to
         // its spinner state on the very next frame, not just after the
         // first task scheduling round-trip.
@@ -1621,9 +1753,16 @@ impl App {
     /// local/remote store paths to compare — if they're missing we
     /// log a hint and skip.
     fn refresh_sizes_for_selected(&mut self) {
-        let Some(node) = self.selected_node().cloned() else {
+        let targets = self.target_nodes();
+        if targets.is_empty() {
             return;
-        };
+        }
+        for node in targets {
+            self.refresh_sizes_for_node(&node);
+        }
+    }
+
+    fn refresh_sizes_for_node(&mut self, node: &Node) {
         let mut launched = 0usize;
         let status = self.status.entry(node.name.clone()).or_default();
         let profiles: Vec<(String, Option<String>, Option<String>)> = node
@@ -1653,16 +1792,45 @@ impl App {
             let override_ = self.override_for(&node.name).clone();
             let tx = self.status_tx.clone();
             let profile_cloned = profile.clone();
+            let flake_cloned = self.flake.clone();
             let handle = tokio::spawn(async move {
+                // Same forwarder pattern as refresh_pkg_diff_for_selected:
+                // host::check_closure_sizes emits free-form progress
+                // strings (especially when it has to build the local
+                // closure, which can take tens of seconds). We convert
+                // each one to a LogLine tagged with the node name so
+                // it lands in that host's details log alongside the
+                // spinner.
+                let (prog_tx, mut prog_rx) =
+                    mpsc::channel::<String>(64);
+                let forwarder_tx = tx.clone();
+                let forwarder_node = node_cloned.name.clone();
+                let forwarder = tokio::spawn(async move {
+                    while let Some(line) = prog_rx.recv().await {
+                        let _ = forwarder_tx
+                            .send(StatusUpdate::LogLine {
+                                node: forwarder_node.clone(),
+                                text: line,
+                                is_err: false,
+                            })
+                            .await;
+                    }
+                });
                 let result = host::check_closure_sizes(
+                    &flake_cloned,
                     &node_cloned,
                     &profile_cloned,
                     &local_path,
                     &remote_path,
                     &override_,
+                    prog_tx,
                 )
                 .await
                 .map_err(|e| format!("{e:#}"));
+                // Drain the forwarder before publishing the final probe
+                // result so the closing "[size] remote: …" line lands
+                // before the inline sizes snap into place.
+                let _ = forwarder.await;
                 let _ = tx
                     .send(StatusUpdate::SizeProbe {
                         node: node_cloned.name.clone(),
@@ -1692,9 +1860,16 @@ impl App {
     /// Expensive-tier update details: full `nix store diff-closures`
     /// output. Same cached-paths precondition as `refresh_sizes_for_selected`.
     fn refresh_pkg_diff_for_selected(&mut self) {
-        let Some(node) = self.selected_node().cloned() else {
+        let targets = self.target_nodes();
+        if targets.is_empty() {
             return;
-        };
+        }
+        for node in targets {
+            self.refresh_pkg_diff_for_node(&node);
+        }
+    }
+
+    fn refresh_pkg_diff_for_node(&mut self, node: &Node) {
         let status = self.status.entry(node.name.clone()).or_default();
         let profiles: Vec<(String, Option<String>, Option<String>)> = node
             .profiles
@@ -1723,6 +1898,7 @@ impl App {
             let node_cloned = node.clone();
             let profile_cloned = profile.clone();
             let override_ = self.override_for(&node.name).clone();
+            let flake_cloned = self.flake.clone();
             let handle = tokio::spawn(async move {
                 // Bridge: host::check_package_diff emits free-form
                 // progress strings; we forward each one as a LogLine
@@ -1747,6 +1923,7 @@ impl App {
                 });
 
                 let result = host::check_package_diff(
+                    &flake_cloned,
                     &node_cloned,
                     &profile_cloned,
                     &local_path,

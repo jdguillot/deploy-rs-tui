@@ -255,26 +255,59 @@ pub async fn check_profile_up_to_date(
 /// and again over SSH against `remote_path`, returning `(local_bytes,
 /// remote_bytes)`. Both calls fail fast on non-zero exit so a missing
 /// `nix` on the remote doesn't silently produce a bogus "0 B" delta.
+///
+/// If the local closure isn't in the store yet, we shell out to
+/// `nix build` against the flake attribute to force evaluation +
+/// build first (see `ensure_local_closure`). `flake` is the flake
+/// reference — same value as the one passed to `check_profile_up_to_date`.
+///
+/// `progress` receives one human-readable line per stage — mostly so
+/// the build step (which can take tens of seconds for a fresh NixOS
+/// system that hasn't been built locally yet) isn't invisible to the
+/// user. The channel is best-effort: a closed receiver is ignored.
 pub async fn check_closure_sizes(
+    flake: &str,
     node: &Node,
     profile: &str,
     local_path: &str,
     remote_path: &str,
     override_: &SshOverride,
+    progress: mpsc::Sender<String>,
 ) -> Result<(u64, u64)> {
-    let local_size = local_closure_size(local_path)
+    // Step 1: make sure the deploy-rs activation wrapper is in the
+    // local store. Nothing to do if it already is.
+    ensure_local_closure(flake, &node.name, profile, local_path, &progress, "size")
+        .await?;
+    // Step 2: resolve the wrapper down to the actual toplevel so we
+    // compare apples-to-apples with the remote's /run/current-system
+    // target. See `resolve_local_toplevel` for the rationale.
+    let resolved_local =
+        resolve_local_toplevel(local_path, remote_path, &progress, "size").await?;
+    let _ = progress
+        .send("[size] measuring local closure …".to_string())
+        .await;
+    let local_size = nix_closure_size(&resolved_local)
         .await
         .context("local `nix path-info --closure-size`")?;
+    let _ = progress
+        .send(format!("[size] local: {} bytes", local_size))
+        .await;
     let target = build_ssh_target(node, profile, override_);
     // Shell-quote the path defensively even though nix store paths are
     // ascii — if the user ever points at something weird we don't want
     // to explode the remote command.
+    let _ = progress
+        .send(format!("[size] measuring remote closure on {target} …"))
+        .await;
     let remote_cmd = format!("nix path-info --closure-size '{remote_path}'");
     let remote = ssh_capture(&target, &remote_cmd, override_)
         .await
         .context("remote `nix path-info --closure-size`")?;
     let remote_size = parse_closure_size(&remote)
         .ok_or_else(|| anyhow!("unparseable remote closure size: `{}`", remote.trim()))?;
+    let _ = progress
+        .send(format!("[size] remote: {} bytes", remote_size))
+        .await;
     Ok((local_size, remote_size))
 }
 
@@ -309,6 +342,7 @@ pub async fn check_closure_sizes(
 /// can see activity instead of staring at a silent spinner. The
 /// channel is best-effort: a closed receiver is ignored.
 pub async fn check_package_diff(
+    flake: &str,
     node: &Node,
     profile: &str,
     local_path: &str,
@@ -318,14 +352,23 @@ pub async fn check_package_diff(
 ) -> Result<String> {
     let target = build_ssh_target(node, profile, override_);
 
+    // Step 1: make sure the wrapper is built, then resolve the real
+    // toplevel inside it — same two-step as check_closure_sizes.
+    ensure_local_closure(flake, &node.name, profile, local_path, &progress, "pkg")
+        .await?;
+    let resolved_local =
+        resolve_local_toplevel(local_path, remote_path, &progress, "pkg").await?;
+
     // Stage 1: list the local closure. This is a pure metadata query
     // against the local store and is essentially instantaneous.
     let _ = progress
         .send("[pkg] listing local closure …".to_string())
         .await;
-    let local_paths = local_requisites(local_path).await.with_context(|| {
-        format!("local `nix-store --query --requisites {local_path}`")
-    })?;
+    let local_paths = nix_requisites(&resolved_local)
+        .await
+        .with_context(|| {
+            format!("local `nix-store --query --requisites {resolved_local}`")
+        })?;
     let _ = progress
         .send(format!("[pkg] local closure: {} paths", local_paths.len()))
         .await;
@@ -400,15 +443,14 @@ pub async fn check_package_diff(
 }
 
 /// Run `nix-store --query --requisites <path>` against the local
-/// store and return one line per store path. This is a metadata query
-/// — it does not realise or copy any of the paths — so it works on
-/// already-built closures and fails fast if the path isn't valid in
-/// the local store.
+/// store and return one line per store path. Pure metadata query —
+/// the caller must guarantee the path is already in the local store
+/// (see `ensure_local_closure`).
 ///
 /// `kill_on_drop(true)` is set so cancelling the awaiting future
 /// (e.g. via the `x` key) actually reaps the child instead of
 /// orphaning a long-running query.
-async fn local_requisites(path: &str) -> Result<Vec<String>> {
+async fn nix_requisites(path: &str) -> Result<Vec<String>> {
     let out = Command::new("nix-store")
         .args(["--query", "--requisites", path])
         .stdin(Stdio::null())
@@ -458,6 +500,16 @@ fn bucket_paths_by_name(paths: &[String]) -> BTreeMap<String, BTreeSet<String>> 
 /// followed by a digit. Paths that have no version (a bare derivation
 /// name like `system-path`) are returned with an empty version
 /// string.
+///
+/// **deploy-rs wrapper suffixes.** After the initial split we peel
+/// known deploy-rs suffixes (`-activate-path`, `-activate-rs`) off
+/// the end of the version and glue them back onto the name. Without
+/// this, `nixos-system-host-26.05.20260405.68d8aa3-activate-path`
+/// parses to name=`nixos-system-host`, version=`26.05.…-activate-path`
+/// — which then looks like a "different version" of the real
+/// `nixos-system-host-26.05.…` path when buckets are compared, and
+/// the diff shows spurious "updates" even when the closures are
+/// identical.
 fn split_name_version(basename: &str) -> (String, String) {
     let after_hash = match basename.find('-') {
         Some(i) => &basename[i + 1..],
@@ -474,13 +526,21 @@ fn split_name_version(basename: &str) -> (String, String) {
             break;
         }
     }
-    match split_at {
+    let (mut name, mut version) = match split_at {
         Some(i) => (
             after_hash[..i].to_string(),
             after_hash[i + 1..].to_string(),
         ),
         None => (after_hash.to_string(), String::new()),
+    };
+    for suffix in ["-activate-path", "-activate-rs"] {
+        if let Some(stripped) = version.strip_suffix(suffix) {
+            version = stripped.to_string();
+            name.push_str(suffix);
+            break;
+        }
     }
+    (name, version)
 }
 
 /// Render a sorted version set as a comma-separated string. Empty
@@ -503,23 +563,10 @@ fn join_versions(versions: &BTreeSet<String>) -> String {
 
 /// Ask the local nix store for the closure size of a path. Parses the
 /// last whitespace-separated column of the first output line, which is
-/// what `nix path-info --closure-size` emits.
-///
-/// Pre-checks that the path actually exists on the local filesystem
-/// first. Without this, `nix path-info --closure-size` falls into its
-/// "I'd need to build/substitute this to know" branch and emits the
-/// cryptic `don't know how to build these paths` error. The user has
-/// no way to act on that without knowing it really means "the local
-/// store doesn't have this closure yet". We translate it into an
-/// actionable hint instead.
-async fn local_closure_size(path: &str) -> Result<u64> {
-    if !std::path::Path::new(path).exists() {
-        return Err(anyhow!(
-            "local closure not built yet: {path}\n\
-             hint: run `nix build {path}^*` (or build the deploy attribute that produces it) \
-             so the closure is realised locally, then retry the size check"
-        ));
-    }
+/// what `nix path-info --closure-size` emits. Pure measurement — the
+/// caller must guarantee the path is already in the local store (see
+/// `ensure_local_closure`).
+async fn nix_closure_size(path: &str) -> Result<u64> {
     let out = Command::new("nix")
         .args(["path-info", "--closure-size", path])
         .stdin(Stdio::null())
@@ -536,6 +583,171 @@ async fn local_closure_size(path: &str) -> Result<u64> {
     let text = String::from_utf8_lossy(&out.stdout);
     parse_closure_size(&text)
         .ok_or_else(|| anyhow!("unparseable local closure size: `{}`", text.trim()))
+}
+
+/// Resolve the deploy-rs activation wrapper at `wrapper_path` down to
+/// the actual system/home toplevel that the remote's
+/// `/run/current-system` (or `~/.local/state/nix/profiles/home-manager`)
+/// symlink will end up pointing at after activation.
+///
+/// Why this matters: the wrapper is a thin derivation whose closure is
+/// a strict superset of the toplevel's — it adds a handful of paths
+/// (the `activate` script, `deploy-rs` itself, `activatable-…`
+/// sub-wrappers) that never reach the deployed system. Comparing the
+/// wrapper against the remote toplevel produces a noisy "5 packages
+/// changed" output even when the systems are bit-identical, because
+/// those wrapper-only paths look like additions on the local side.
+///
+/// We identify the toplevel among the wrapper's direct references by
+/// matching parsed package names against the remote basename. Both
+/// sides use the same naming scheme (`nixos-system-<host>`,
+/// `home-manager-generation`, etc.), so the match is unambiguous.
+///
+/// If anything goes wrong — `nix-store --query --references` fails, no
+/// reference matches, etc. — we fall back to returning the wrapper
+/// path itself and log a line so the user sees why the diff is noisy.
+async fn resolve_local_toplevel(
+    wrapper_path: &str,
+    remote_path: &str,
+    progress: &mpsc::Sender<String>,
+    tag: &str,
+) -> Result<String> {
+    let remote_base = remote_path.rsplit('/').next().unwrap_or(remote_path);
+    let (remote_name, _) = split_name_version(remote_base);
+    if remote_name.is_empty() {
+        return Ok(wrapper_path.to_string());
+    }
+    let out = Command::new("nix-store")
+        .args(["--query", "--references", wrapper_path])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("spawning `nix-store --query --references`")?;
+    if !out.status.success() {
+        let _ = progress
+            .send(format!(
+                "[{tag}] couldn't list wrapper references, diffing against wrapper"
+            ))
+            .await;
+        return Ok(wrapper_path.to_string());
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let p = line.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let base = p.rsplit('/').next().unwrap_or(p);
+        let (name, _) = split_name_version(base);
+        if name == remote_name {
+            let _ = progress
+                .send(format!("[{tag}] resolved local toplevel: {p}"))
+                .await;
+            return Ok(p.to_string());
+        }
+    }
+    let _ = progress
+        .send(format!(
+            "[{tag}] no wrapper reference matched `{remote_name}`, diffing against wrapper"
+        ))
+        .await;
+    Ok(wrapper_path.to_string())
+}
+
+/// Make sure the local closure for a deploy-rs profile exists on this
+/// machine. If the store path is already present we're done; otherwise
+/// we drive `nix build` against the flake attribute so Nix evaluates
+/// the profile, instantiates its derivation, pulls from substituters
+/// or builds locally as needed, and populates the store.
+///
+/// `nix-store --realise` is NOT enough here — it only works when the
+/// path's corresponding `.drv` is already in the local store. In our
+/// case the caller got `path` from `nix eval --raw`, which *evaluates*
+/// the profile's `.path` attribute (returning a string) but never
+/// instantiates a derivation on disk. Without a `.drv`, `nix-store
+/// --realise` can't know how to build the closure and dies with
+/// `don't know how to build these paths`. Going through `nix build
+/// <flake>#deploy.nodes.<node>.profiles.<profile>.path` re-enters the
+/// flake, which *does* instantiate and build.
+///
+/// `tag` prefixes the progress lines so the user can see which feature
+/// triggered the build (`size` for closure size, `pkg` for the
+/// package diff). `kill_on_drop(true)` is set so cancelling the task
+/// (key `x`) tears down the builder child instead of leaving it
+/// running in the background.
+async fn ensure_local_closure(
+    flake: &str,
+    node: &str,
+    profile: &str,
+    path: &str,
+    progress: &mpsc::Sender<String>,
+    tag: &str,
+) -> Result<()> {
+    if std::path::Path::new(path).exists() {
+        return Ok(());
+    }
+    let attr = format!("{flake}#deploy.nodes.{node}.profiles.{profile}.path");
+    let _ = progress
+        .send(format!(
+            "[{tag}] local closure missing, building {attr} …"
+        ))
+        .await;
+    // --no-link avoids dropping a `result` symlink in the user's cwd;
+    // --print-out-paths gives us the store path nix actually settled
+    // on, which we can sanity-check against `path` afterwards.
+    let out = Command::new("nix")
+        .args([
+            "build",
+            "--no-link",
+            "--no-warn-dirty",
+            "--print-out-paths",
+            &attr,
+        ])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("spawning `nix build`")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow!(
+            "`nix build {attr}` failed — couldn't materialise the \
+             local closure.\n\
+             hint: make sure the deploy attribute is buildable from \
+             this machine (try running the command above by hand to \
+             see the full nix output), then retry.\n\
+             nix stderr: {}",
+            stderr.trim()
+        ));
+    }
+    // Pull the (possibly multi-line) out-path list from stdout and
+    // sanity-check that at least one entry matches the path we were
+    // asked to ensure. The profile's `.path` attribute in deploy-rs
+    // stringifies as `<outPath>/activate`, so nix build prints the
+    // parent directory — the same value the caller already trimmed to.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let built: Vec<&str> = stdout.lines().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let _ = progress
+        .send(format!(
+            "[{tag}] built {} path(s): {}",
+            built.len(),
+            built.join(" ")
+        ))
+        .await;
+    // After nix build, the original path should exist. If it still
+    // doesn't, something upstream has a mismatched `.path` attribute
+    // vs. the built derivation — surface that clearly so the user
+    // doesn't get a confusing downstream error from `nix path-info`.
+    if !std::path::Path::new(path).exists() {
+        return Err(anyhow!(
+            "`nix build {attr}` succeeded but expected store path \
+             `{path}` still isn't present.\n\
+             hint: the profile's `.path` attribute may not match the \
+             derivation it's wrapping. nix build produced: {}",
+            built.join(" ")
+        ));
+    }
+    Ok(())
 }
 
 /// `nix path-info --closure-size` prints rows like `<path>\t<bytes>`;
