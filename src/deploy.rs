@@ -343,7 +343,10 @@ mod tests {
 
     #[test]
     fn strips_bare_esc_and_control_bytes() {
+        // \x05 (ENQ) is a bare control byte → stripped.
+        // \x1b consumes the next byte as a two-byte escape → " " eaten.
+        // \x7f (DEL) → stripped.
         let input = "warn\x05ing \x1b ok\x7f";
-        assert_eq!(strip_ansi(input), "warning  ok");
+        assert_eq!(strip_ansi(input), "warning ok");
     }
 }

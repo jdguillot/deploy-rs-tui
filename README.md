@@ -11,14 +11,28 @@ immediate switch or as a new boot entry for next boot.
 - Auto-discovers every entry in `deploy.nodes` from a flake.
 - Per-host **online/offline** indicator (TCP probe of port 22, no ICMP /
   no sudo required).
-- On-demand **update check** that compares the locally-built profile
-  store path against the remote machine's `/run/current-system` (system)
-  and home-manager profile (home).
+- On-demand **update check** (`u`) that compares the locally-built
+  profile store path against the remote machine's `/run/current-system`
+  (system) and home-manager profile (home). Correctly resolves the
+  deploy-rs activation wrapper to its toplevel so hosts that are already
+  current show `✓` rather than a spurious `↑`.
+- **Closure size delta + package diff** (`Shift+U`) — measures the
+  local vs. remote closure sizes and then automatically runs a
+  metadata-only package-version diff (no heavy `nix copy`). Detects
+  content-only changes (e.g. config file edits that don't bump any
+  package version) and surfaces them distinctly.
+- **Multi-host operations** — mark multiple hosts with `Space`, then
+  `u` / `Shift+U` / `s` / `b` / `d` operate on all marked hosts at
+  once.
 - Choose what to deploy: **all profiles** / **system only** / **home only**.
 - Choose how to deploy: **switch** (immediate), **boot** (next boot),
   or **dry-run** (`deploy --dry-activate`, build + diff only).
-- Live, line-buffered log of the running `deploy` process inside the
-  details pane. Cancelling kills the child cleanly.
+- **Job log pane** with live, line-buffered, ANSI-stripped `deploy`
+  output. Each host gets a coloured prefix for legible batch output.
+  Cancelling kills the child cleanly.
+- **Log search** (`/`) with `n`/`N` navigation, `[current/total]`
+  counter in the pane title, and a distinct cyan highlight on the active
+  match.
 - **Per-host SSH overrides** — for nodes that aren't in your
   `~/.ssh/config`, set hostname/IP, ssh user, identity file, and extra
   `-o` options from inside the TUI. Hosts with overrides show a magenta
@@ -26,6 +40,8 @@ immediate switch or as a new boot entry for next boot.
 - **Toggles** for the deploy-rs flags you reach for most:
   `--skip-checks`, `--magic-rollback`, `--auto-rollback`,
   `--remote-build`, `--interactive-sudo`. Always-visible state strip.
+- **Pane-jump keys** (`f`/`i`/`v`/`t`/`c`) for instant focus on any
+  pane; `Tab`/`Shift+Tab` for sequential cycling.
 - **Help popup** (`?`) with a full guide to every key, badge, and toggle.
 
 ## Requirements
@@ -73,20 +89,26 @@ Optional flags:
 
 ## Key bindings
 
-| key            | action                                                   |
-| -------------- | -------------------------------------------------------- |
-| `?`            | open the in-app help popup (full reference)              |
-| `q` / `Esc`    | quit                                                     |
-| `Ctrl-C`       | quit (also cancels any running deploy)                   |
-| `↑` / `↓` / `j` / `k` | move host selection                               |
-| `Tab`          | swap focus between host list and details pane            |
-| `r`            | refresh online/offline for every host                    |
-| `u`            | check whether the selected host needs an update          |
-| `a` / `n` / `h` | target all profiles / system (NixOS) / home (home-manager) |
-| `s` / `b` / `d` | deploy: switch now / install as next boot entry / dry run |
-| `x`            | cancel the running deploy                                |
-| `1`–`5`        | toggle deploy-rs flags (see below)                       |
-| `o`            | open the SSH overrides menu for the selected host        |
+| key            | action                                                       |
+| -------------- | ------------------------------------------------------------ |
+| `?`            | open the in-app help popup (full reference)                  |
+| `q` / `Esc`    | quit (Esc also clears active search)                         |
+| `Ctrl-C`       | quit (also cancels any running deploy)                       |
+| `j` / `k`      | move selection / scroll log                                  |
+| `g` / `G`      | jump to top / snap to tail                                   |
+| `Space`        | mark/unmark host for batch operations                        |
+| `Tab` / `Shift+Tab` | cycle focus forward / backward                          |
+| `f`/`i`/`v`/`t`/`c` | jump to hosts / details / job log / toggles / commands  |
+| `r`            | refresh online/offline for every host                        |
+| `u`            | cheap-tier update check (paths + activation time)            |
+| `Shift+U`      | full update check: closure size delta + package diff         |
+| `a` / `y` / `h` | target all profiles / system (sYs) / home (home-manager)   |
+| `s` / `b` / `d` | deploy: switch now / boot entry / dry run                  |
+| `x`            | cancel the running deploy                                    |
+| `/`            | search the focused log pane                                  |
+| `n` / `N`      | next / previous search match                                 |
+| `1`–`5`        | toggle deploy-rs flags (see below)                           |
+| `o`            | open the SSH overrides menu for the selected host            |
 
 ### Toggles (`1`–`5`)
 
@@ -127,13 +149,31 @@ gets pushed.
 
 ## Update-check details
 
-The update probe runs `nix eval --raw <flake>#deploy.nodes.<name>.profiles.<p>.path`
-to materialise the activation closure, then compares its store path
-against `readlink -f /run/current-system` (for `system`) or the
-home-manager profile symlink (for `home`). It's intentionally
-on-demand because the eval can be slow on large flakes.
+### Cheap tier (`u`)
 
-The badge next to each host means:
+Runs `nix eval --raw <flake>#deploy.nodes.<name>.profiles.<p>.path` to
+get the deploy-rs activation wrapper, resolves it to the actual system
+toplevel via `nix-store --query --references`, then compares that
+against `readlink -f /run/current-system` (for `system`) or the
+home-manager profile symlink (for `home`). Falls back to a parsed
+name+version comparison when the wrapper isn't in the local store yet.
+On-demand because the eval can be slow on large flakes.
+
+### Full tier (`Shift+U`)
+
+After a successful `u`, this measures `nix path-info --closure-size`
+on both sides, then runs a metadata-only package diff by listing
+`nix-store --query --requisites` locally and remotely. Version
+changes, additions, and removals are surfaced per-package. When every
+package name+version matches but store paths still differ (e.g. a
+config file rebuild), the TUI shows a distinct "content differs"
+indicator and lists the divergent paths so the user can identify what
+changed.
+
+Stale size and package data are automatically cleared when `u` is
+re-run or after a successful deploy.
+
+### Badges
 
 | badge       | meaning                                              |
 | ----------- | ---------------------------------------------------- |

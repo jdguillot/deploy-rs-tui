@@ -24,9 +24,10 @@ All of these assume you're inside the dev shell (`nix develop`) so that
 | format                | `cargo fmt`                                   |
 | nix build             | `nix build`                                   |
 
-There are no tests yet. When adding any, prefer integration-style tests
-that mock `nix` / `deploy` / `ssh` via `PATH` shims rather than unit
-tests over the wrapper functions — the wrapper functions are very thin.
+Tests live in `deploy.rs` (ANSI-stripping unit tests). When adding more,
+prefer integration-style tests that mock `nix` / `deploy` / `ssh` via
+`PATH` shims rather than unit tests over the wrapper functions — the
+wrapper functions are very thin.
 
 ## Architecture
 
@@ -118,7 +119,35 @@ Key invariants worth knowing before touching the code:
   cancelling (key `x`) actually reaps the child instead of orphaning
   it. Don't remove it.
 - **`NO_COLOR=1`** is set on the spawned `deploy` so its output stays
-  legible when forwarded line-by-line into ratatui.
+  legible when forwarded line-by-line into ratatui. Additionally,
+  `deploy.rs::strip_ansi` removes any ANSI escape sequences (CSI, OSC,
+  bare ESC, control bytes) that leak through from nested `nix`/`ssh`
+  children — without this, ratatui's width accounting drifts and
+  characters get dropped from the visible text.
+- **`Shift+U` chains size + package diff.** There is no separate `p`
+  keybind. When a `SizeProbe` Ok arrives in `apply_status`, it
+  auto-triggers `spawn_pkg_diff_for_profile` for the same
+  `(node, profile)`. This keeps the details pane populated in one
+  gesture.
+- **Extras (size, pkg_diff) are cleared** both when `u` re-runs (in
+  `apply_status` → `UpdateProbe` Ok) and when a deploy succeeds (the
+  `LogLine::Exit` handler resets `ProfileExtra` to default). This
+  prevents stale numbers from lingering after the closure changes.
+- **Content-only change detection.** When `check_package_diff` finds no
+  name+version differences but the store-path sets still diverge, it
+  emits a `(content-only) N path(s) differ` summary line plus sample
+  basenames. The UI detects the `(content-only)` prefix and renders a
+  yellow "packages identical, content differs" badge instead of the
+  misleading green "packages identical".
+- **Scroll clamping happens before the title chip reads it.** Both
+  `draw_job_log` and `draw_details` compute inner dimensions and run
+  `compute_tail_scroll_offset` (which clamps in place) before
+  constructing the `[↑N]` chip. This prevents a one-frame flash of a
+  stale value when holding `k` past the top.
+- **Search highlight: active match is cyan**, all other matches are
+  magenta. `highlight_match` takes a `current_match` (1-based global
+  index from `log_search_stats`) and a `&mut match_counter` to
+  distinguish the active hit across the entire pane.
 - **`--interactive-sudo true` will hang the TUI**, by design — the
   child reads from `Stdio::null()`. Toggle 5 is exposed for
   completeness; the help popup tells the user to press `x` to recover.

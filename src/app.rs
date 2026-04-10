@@ -274,6 +274,12 @@ pub struct App {
     /// panes share `App.log_search` storage but only the targeted one
     /// renders highlights and responds to `n`/`Shift+N`.
     pub log_search_target: Option<SearchTarget>,
+    /// 1-based index of the "active" match occurrence across the entire
+    /// targeted pane. `n` increments, `N` decrements, wrapping at the
+    /// edges. The rendering pass highlights this occurrence in cyan
+    /// while all other matches stay magenta. Reset to 0 (no active
+    /// match) when the search is cleared.
+    pub log_search_match_idx: usize,
     /// Committed help-popup filter. `Some(q)` hides every help line
     /// that doesn't contain the substring; `None` shows everything.
     /// Lives outside InputMode because the help popup is its own modal
@@ -367,6 +373,7 @@ impl App {
             busy_label: None,
             log_search: None,
             log_search_target: None,
+            log_search_match_idx: 0,
             help_search: None,
             last_deploy: None,
             last_deploys: HashMap::new(),
@@ -1350,78 +1357,87 @@ impl App {
     /// `direction = -1` walks toward older lines (larger scroll). The
     /// log buffer order is oldest→newest so newer = higher index.
     fn search_log_jump(&mut self, direction: i32) {
-        let Some(query) = self.log_search.clone() else {
-            return;
-        };
-        let filtered = self.filtered_log_indices_for_details();
-        if filtered.is_empty() {
-            return;
-        }
-        // Convert the current scroll into a "cursor index" inside the
-        // filtered slice. scroll == 0 means the cursor sits at the
-        // last entry; scroll == filtered.len() - 1 sits at the first.
-        let cursor = filtered
-            .len()
-            .saturating_sub(1)
-            .saturating_sub(self.log_scroll);
-        if let Some(next) = next_match(&filtered, &self.log, &query, cursor, direction) {
-            self.log_scroll = filtered.len().saturating_sub(1).saturating_sub(next);
-        }
+        self.advance_match(SearchTarget::DetailsLog, direction);
     }
 
     fn search_job_log_jump(&mut self, direction: i32) {
-        let Some(query) = self.log_search.clone() else {
-            return;
-        };
-        let filtered = self.filtered_log_indices_for_job_log();
-        if filtered.is_empty() {
-            return;
-        }
-        let cursor = filtered
-            .len()
-            .saturating_sub(1)
-            .saturating_sub(self.job_log_scroll);
-        if let Some(next) = next_match(&filtered, &self.log, &query, cursor, direction) {
-            self.job_log_scroll = filtered.len().saturating_sub(1).saturating_sub(next);
-        }
+        self.advance_match(SearchTarget::JobLog, direction);
     }
 
-    /// First-jump variant: like `search_log_jump(-1)` but starts the
-    /// walk at the very last filtered entry (the tail) instead of
-    /// requiring the user to be already-near a match. Used right after
-    /// commit so the cursor lands on something visible.
+    /// First-jump variant: set the active match to the last occurrence
+    /// (nearest the tail) and scroll to it. Used right after commit so
+    /// the cursor lands on something visible.
     fn search_log_jump_initial(&mut self) {
-        let Some(query) = self.log_search.clone() else {
+        let Some(query) = self.log_search.as_ref() else {
             return;
         };
-        let filtered = self.filtered_log_indices_for_details();
-        if filtered.is_empty() {
-            return;
-        }
-        // Walk from tail (newest) backwards looking for the first hit.
-        let last = filtered.len() - 1;
-        for i in (0..=last).rev() {
-            if self.log[filtered[i]].text.contains(&query) {
-                self.log_scroll = last - i;
-                return;
-            }
-        }
+        let total = self.count_all_matches(SearchTarget::DetailsLog, query);
+        self.log_search_match_idx = total;
+        self.scroll_to_match(SearchTarget::DetailsLog);
     }
 
     fn search_job_log_jump_initial(&mut self) {
-        let Some(query) = self.log_search.clone() else {
+        let Some(query) = self.log_search.as_ref() else {
             return;
         };
-        let filtered = self.filtered_log_indices_for_job_log();
+        let total = self.count_all_matches(SearchTarget::JobLog, query);
+        self.log_search_match_idx = total;
+        self.scroll_to_match(SearchTarget::JobLog);
+    }
+
+    /// Increment (direction=+1) or decrement (direction=-1) the active
+    /// match index, wrapping at the edges, then scroll so the line
+    /// containing the match is visible.
+    fn advance_match(&mut self, target: SearchTarget, direction: i32) {
+        let Some(query) = self.log_search.as_ref() else {
+            return;
+        };
+        let total = self.count_all_matches(target, query);
+        if total == 0 {
+            return;
+        }
+        // Wrap: going past total → 1, going below 1 → total.
+        let cur = self.log_search_match_idx as i32 + direction;
+        self.log_search_match_idx = if cur < 1 {
+            total
+        } else if cur > total as i32 {
+            1
+        } else {
+            cur as usize
+        };
+        self.scroll_to_match(target);
+    }
+
+    /// Scroll the targeted pane so the line containing the current
+    /// active match (by `log_search_match_idx`) is visible. Finds the
+    /// Nth occurrence by walking filtered entries and counting per-line
+    /// hits.
+    fn scroll_to_match(&mut self, target: SearchTarget) {
+        let Some(query) = self.log_search.as_ref() else {
+            return;
+        };
+        let filtered = match target {
+            SearchTarget::DetailsLog => self.filtered_log_indices_for_details(),
+            SearchTarget::JobLog => self.filtered_log_indices_for_job_log(),
+        };
         if filtered.is_empty() {
             return;
         }
-        let last = filtered.len() - 1;
-        for i in (0..=last).rev() {
-            if self.log[filtered[i]].text.contains(&query) {
-                self.job_log_scroll = last - i;
+        let mut seen = 0usize;
+        for (i, &idx) in filtered.iter().enumerate() {
+            let hits = self.log[idx].text.matches(query).count();
+            if hits > 0 && seen + hits >= self.log_search_match_idx {
+                // This filtered entry contains the active match.
+                // Convert filtered-entry index to scroll offset:
+                // scroll == 0 ↔ tail, scroll == len-1 ↔ top.
+                let scroll = filtered.len().saturating_sub(1).saturating_sub(i);
+                match target {
+                    SearchTarget::DetailsLog => self.log_scroll = scroll,
+                    SearchTarget::JobLog => self.job_log_scroll = scroll,
+                }
                 return;
             }
+            seen += hits;
         }
     }
 
@@ -1430,15 +1446,13 @@ impl App {
     fn clear_log_search(&mut self) {
         self.log_search = None;
         self.log_search_target = None;
+        self.log_search_match_idx = 0;
     }
 
-    /// Return `(current, total)` match counts for a committed log
-    /// search on `target`. `current` is the 1-based index of the
-    /// last match at or before the pane's current cursor position;
-    /// `0` means the cursor sits above the first match (no match
-    /// behind the view yet). `total` is the full count across the
-    /// pane's filtered view. Returns `(0, 0)` when no search is
-    /// active for `target`.
+    /// Return `(current, total)` for the committed log search on
+    /// `target`. `current` is `log_search_match_idx` (1-based); `total`
+    /// is the count of every individual occurrence of the query across
+    /// all filtered lines (a single line with two hits counts twice).
     pub fn log_search_stats(&self, target: SearchTarget) -> (usize, usize) {
         let Some(query) = self.log_search.as_ref() else {
             return (0, 0);
@@ -1446,25 +1460,21 @@ impl App {
         if self.log_search_target != Some(target) {
             return (0, 0);
         }
-        let (filtered, scroll) = match target {
-            SearchTarget::DetailsLog => (self.filtered_log_indices_for_details(), self.log_scroll),
-            SearchTarget::JobLog => (self.filtered_log_indices_for_job_log(), self.job_log_scroll),
+        let total = self.count_all_matches(target, query);
+        (self.log_search_match_idx, total)
+    }
+
+    /// Total number of individual query occurrences in the targeted pane.
+    fn count_all_matches(&self, target: SearchTarget, query: &str) -> usize {
+        let filtered = match target {
+            SearchTarget::DetailsLog => self.filtered_log_indices_for_details(),
+            SearchTarget::JobLog => self.filtered_log_indices_for_job_log(),
         };
-        if filtered.is_empty() {
-            return (0, 0);
-        }
-        let cursor = filtered.len().saturating_sub(1).saturating_sub(scroll);
         let mut total = 0usize;
-        let mut current = 0usize;
-        for (i, &idx) in filtered.iter().enumerate() {
-            if self.log[idx].text.contains(query) {
-                total += 1;
-                if i <= cursor {
-                    current = total;
-                }
-            }
+        for &idx in &filtered {
+            total += self.log[idx].text.matches(query).count();
         }
-        (current, total)
+        total
     }
 
     /// Indices into `self.log` that the details pane currently shows
@@ -2046,9 +2056,7 @@ impl App {
                 // details pane ends up with the full picture without
                 // the user having to orchestrate it.
                 if let Some((local_path, remote_path)) = chain_paths {
-                    if let Some(node_obj) =
-                        self.nodes.iter().find(|n| n.name == node).cloned()
-                    {
+                    if let Some(node_obj) = self.nodes.iter().find(|n| n.name == node).cloned() {
                         self.spawn_pkg_diff_for_profile(
                             &node_obj,
                             &profile,
@@ -2448,34 +2456,6 @@ async fn recv_optional<T>(rx: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
         Some(r) => r.recv().await,
         None => std::future::pending().await,
     }
-}
-
-/// Walk a filtered slice of log indices looking for the next entry
-/// whose text contains `query`. `cursor` is the user's current
-/// position inside `filtered` and `direction` is `+1` for "newer"
-/// (toward the tail, higher index) or `-1` for "older" (toward the
-/// head, lower index). Returns the new cursor index inside `filtered`,
-/// or `None` if there's no match in the requested direction.
-fn next_match(
-    filtered: &[usize],
-    log: &[LogEntry],
-    query: &str,
-    cursor: usize,
-    direction: i32,
-) -> Option<usize> {
-    if filtered.is_empty() {
-        return None;
-    }
-    let len = filtered.len() as i32;
-    let mut i = cursor as i32 + direction;
-    while i >= 0 && i < len {
-        let idx = filtered[i as usize];
-        if log[idx].text.contains(query) {
-            return Some(i as usize);
-        }
-        i += direction;
-    }
-    None
 }
 
 /// Walk `~/.ssh` and return the paths that look like private keys. We

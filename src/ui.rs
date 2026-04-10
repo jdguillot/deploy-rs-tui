@@ -451,31 +451,17 @@ fn badge(
 
 fn draw_details(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == FocusPane::Details;
-    // Surface the active search query in the pane title so the user
-    // can see what they're filtering on without consulting the input
-    // strip. Only fires when the committed search is pinned to the
-    // details pane (job-log searches don't bleed across).
-    let mut title_spans = pane_title_spans("details", 'i', focused);
-    if let (Some(q), Some(crate::app::SearchTarget::DetailsLog)) =
-        (app.log_search.as_ref(), app.log_search_target)
-    {
-        let (cur, total) = app.log_search_stats(crate::app::SearchTarget::DetailsLog);
-        title_spans.push(search_chip(q, cur, total));
-    }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(focus_border_style(focused))
-        .title(Line::from(title_spans));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
 
-    // Build the extras lines up front so we can size the layout to
-    // their actual height — using `Min(N)` made the extras pane
-    // grab all the spare vertical space and pushed the log down
-    // with a giant empty gap.
+    // Compute inner dimensions first (borders only — title doesn't
+    // affect them) so we can figure out the log area, clamp the
+    // scroll, and *then* build the title with the correct `[↑N]`
+    // chip. Without this ordering the chip would show the pre-clamp
+    // value for one frame before snapping, looking janky.
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+
     let extras_lines = build_profile_extras_lines(app);
     let extras_height = extras_lines.len() as u16;
-    if extras_height > 0 {
+    let (summary_area, extras_area, log_area) = if extras_height > 0 {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -484,19 +470,48 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &mut App) {
                 Constraint::Min(3),
             ])
             .split(inner);
-        draw_node_summary(frame, rows[0], app);
-        frame.render_widget(
-            Paragraph::new(extras_lines).wrap(Wrap { trim: false }),
-            rows[1],
-        );
-        draw_log(frame, rows[2], app);
+        (rows[0], Some(rows[1]), rows[2])
     } else {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(11), Constraint::Min(3)])
             .split(inner);
-        draw_node_summary(frame, rows[0], app);
-        draw_log(frame, rows[1], app);
+        (rows[0], None, rows[1])
+    };
+
+    // Pre-build filtered log lines and clamp scroll against the
+    // actual log area dimensions.
+    let (log_lines, log_y_offset) = build_log_lines_and_clamp(app, log_area);
+
+    // Title chips now read the already-clamped scroll.
+    let mut title_spans = pane_title_spans("details", 'i', focused);
+    if let (Some(q), Some(crate::app::SearchTarget::DetailsLog)) =
+        (app.log_search.as_ref(), app.log_search_target)
+    {
+        let (cur, total) = app.log_search_stats(crate::app::SearchTarget::DetailsLog);
+        title_spans.push(search_chip(q, cur, total));
+    }
+    if app.log_scroll > 0 {
+        title_spans.push(scroll_chip(app.log_scroll));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(focus_border_style(focused))
+        .title(Line::from(title_spans));
+    frame.render_widget(block, area);
+
+    draw_node_summary(frame, summary_area, app);
+    if let Some(ea) = extras_area {
+        frame.render_widget(Paragraph::new(extras_lines).wrap(Wrap { trim: false }), ea);
+    }
+    if !log_lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(log_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((log_y_offset, 0)),
+            log_area,
+        );
     }
 }
 
@@ -899,39 +914,16 @@ fn job_log_prefix_width(app: &App) -> usize {
 /// before kicking off a job and then scroll once output starts.
 fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == FocusPane::JobLog;
-    // Pane title gets a `[/query]` chip when a job-log search is
-    // active so the user can see what they're filtering on without
-    // looking at the input strip, plus a `[↑N]` chip when the user
-    // has scrolled back from the tail.
-    let mut title_spans = pane_title_spans("job log", 'v', focused);
-    if let (Some(q), Some(crate::app::SearchTarget::JobLog)) =
-        (app.log_search.as_ref(), app.log_search_target)
-    {
-        let (cur, total) = app.log_search_stats(crate::app::SearchTarget::JobLog);
-        title_spans.push(search_chip(q, cur, total));
-    }
-    if app.job_log_scroll > 0 {
-        title_spans.push(scroll_chip(app.job_log_scroll));
-    }
+
+    // Compute inner dimensions first (borders only — title doesn't
+    // shrink it) so we can clamp the scroll *before* building the
+    // title. Without this ordering the `[↑N]` chip flashes the
+    // pre-clamp value for one frame before snapping down, which looks
+    // janky when holding `k` past the top.
+    let inner = Block::default().borders(Borders::ALL).inner(area);
 
     let width = job_log_prefix_width(app);
     let tagged: Vec<&crate::app::LogEntry> = app.log.iter().filter(|e| e.host.is_some()).collect();
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(focus_border_style(focused))
-        .title(Line::from(title_spans));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if tagged.is_empty() {
-        let empty = Line::styled(
-            " (no deploy output yet — press s / b / d to start)",
-            Style::default().fg(Color::DarkGray),
-        );
-        frame.render_widget(Paragraph::new(empty), inner);
-        return;
-    }
 
     let query = if matches!(
         app.log_search_target,
@@ -942,11 +934,22 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
         None
     };
 
-    // Build every filtered line up-front. Rendering the full set (and
-    // scrolling into it) is what fixes the wrap-clip bug: the earlier
-    // version picked `height` entries and let Paragraph clip the
-    // overflow from the bottom, so long `[pkg] listing …` lines would
-    // push the tail off-screen even with `scroll == 0`.
+    // The "current match" index (1-based) so the active search result
+    // gets a distinct cyan highlight.
+    let current_match = if query.is_some() {
+        let (cur, _) = app.log_search_stats(crate::app::SearchTarget::JobLog);
+        if cur > 0 {
+            Some(cur)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut match_counter = 0usize;
+
+    // Build every filtered line up-front and clamp scroll before the
+    // title reads it.
     let all_lines: Vec<Line> = tagged
         .iter()
         .map(|entry| {
@@ -963,14 +966,51 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
                 prefix,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )];
-            spans.extend(highlight_match(&entry.text, query, body_style));
+            spans.extend(highlight_match(
+                &entry.text,
+                query,
+                body_style,
+                current_match,
+                &mut match_counter,
+            ));
             Line::from(spans)
         })
         .collect();
 
     let visible = inner.height as usize;
-    let y_offset =
-        compute_tail_scroll_offset(&all_lines, &mut app.job_log_scroll, inner.width, visible);
+    let y_offset = if tagged.is_empty() {
+        app.job_log_scroll = 0;
+        0
+    } else {
+        compute_tail_scroll_offset(&all_lines, &mut app.job_log_scroll, inner.width, visible)
+    };
+
+    // Now build the title with the already-clamped scroll value.
+    let mut title_spans = pane_title_spans("job log", 'v', focused);
+    if let (Some(q), Some(crate::app::SearchTarget::JobLog)) =
+        (app.log_search.as_ref(), app.log_search_target)
+    {
+        let (cur, total) = app.log_search_stats(crate::app::SearchTarget::JobLog);
+        title_spans.push(search_chip(q, cur, total));
+    }
+    if app.job_log_scroll > 0 {
+        title_spans.push(scroll_chip(app.job_log_scroll));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(focus_border_style(focused))
+        .title(Line::from(title_spans));
+    frame.render_widget(block, area);
+
+    if tagged.is_empty() {
+        let empty = Line::styled(
+            " (no deploy output yet — press s / b / d to start)",
+            Style::default().fg(Color::DarkGray),
+        );
+        frame.render_widget(Paragraph::new(empty), inner);
+        return;
+    }
 
     frame.render_widget(
         Paragraph::new(all_lines)
@@ -1053,14 +1093,11 @@ fn compute_tail_scroll_offset(
     y.min(u16::MAX as usize) as u16
 }
 
-fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
-    // The details-pane log shows app-level status messages. Untagged
-    // lines (global state like reachability sweeps) are always
-    // visible; host-tagged lines only show when that host is the
-    // selected one — so moving between hosts swaps the pane rather
-    // than revealing stale messages from the previously-highlighted
-    // host. Actual deploy-rs stdout lives in the job log pane and
-    // never reaches this filter.
+/// Build filtered details-log lines and clamp the scroll in one pass.
+/// Called by `draw_details` *before* the pane title is constructed so
+/// the `[↑N]` chip always shows the post-clamp value and never
+/// flashes a stale number.
+fn build_log_lines_and_clamp(app: &mut App, area: Rect) -> (Vec<Line<'static>>, u16) {
     let selected_name = app.selected_node().map(|n| n.name.to_string());
     let filtered: Vec<&crate::app::LogEntry> = app
         .log
@@ -1081,13 +1118,20 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
         None
     };
     if filtered.is_empty() {
-        return;
+        app.log_scroll = 0;
+        return (Vec::new(), 0);
     }
-    // Build every line up-front so we can render the full paragraph
-    // and use row-exact scroll. Picking `height` entries by count and
-    // letting the Paragraph clip the overflow was dropping the tail
-    // whenever long `[pkg] listing …` lines wrapped, so the details
-    // log was missing its newest rows despite `scroll == 0`.
+    let current_match = if query.is_some() {
+        let (cur, _) = app.log_search_stats(crate::app::SearchTarget::DetailsLog);
+        if cur > 0 {
+            Some(cur)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut match_counter = 0usize;
     let all_lines: Vec<Line> = filtered
         .iter()
         .map(|entry| {
@@ -1096,29 +1140,45 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 Style::default()
             };
-            Line::from(highlight_match(&entry.text, query, style))
+            Line::from(highlight_match(
+                &entry.text,
+                query,
+                style,
+                current_match,
+                &mut match_counter,
+            ))
         })
         .collect();
     let visible = area.height as usize;
     let y_offset = compute_tail_scroll_offset(&all_lines, &mut app.log_scroll, area.width, visible);
-    frame.render_widget(
-        Paragraph::new(all_lines)
-            .wrap(Wrap { trim: false })
-            .scroll((y_offset, 0)),
-        area,
-    );
+    (all_lines, y_offset)
 }
 
-/// Split `text` into spans, highlighting every occurrence of `query`
-/// (when present) with a yellow background. The non-matching segments
-/// keep `base_style`. When `query` is `None` or empty we return a
-/// single span with `base_style` so callers don't have to special-case.
-fn highlight_match(text: &str, query: Option<&str>, base_style: Style) -> Vec<Span<'static>> {
+/// Highlight every occurrence of `query` in `text`. Non-matching
+/// segments keep `base_style`; matches get a magenta background.
+///
+/// `current_match` / `match_counter` implement "active match"
+/// highlighting: the Nth global match across the entire pane (1-based,
+/// matching `log_search_stats().0`) renders with a cyan background
+/// instead of magenta so the user can tell which hit they're on when
+/// pressing `n`/`N`. Pass `None` / a dummy counter when the pane
+/// isn't the search-target pane to skip the special highlighting.
+fn highlight_match(
+    text: &str,
+    query: Option<&str>,
+    base_style: Style,
+    current_match: Option<usize>,
+    match_counter: &mut usize,
+) -> Vec<Span<'static>> {
     let Some(q) = query.filter(|q| !q.is_empty()) else {
         return vec![Span::styled(text.to_string(), base_style)];
     };
     let hi = base_style
         .bg(Color::Magenta)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
+    let hi_current = base_style
+        .bg(Color::Cyan)
         .fg(Color::Black)
         .add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
@@ -1129,7 +1189,13 @@ fn highlight_match(text: &str, query: Option<&str>, base_style: Style) -> Vec<Sp
         if start > cursor {
             spans.push(Span::styled(text[cursor..start].to_string(), base_style));
         }
-        spans.push(Span::styled(text[start..start + qlen].to_string(), hi));
+        *match_counter += 1;
+        let style = if current_match == Some(*match_counter) {
+            hi_current
+        } else {
+            hi
+        };
+        spans.push(Span::styled(text[start..start + qlen].to_string(), style));
         cursor = start + qlen;
     }
     if cursor < text.len() {
@@ -1677,11 +1743,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         ),
         key_line(
             "Shift+U",
-            "medium tier: closure size delta (needs prior u)",
-        ),
-        key_line(
-            "p",
-            "package diff: per-name version changes via metadata-only requisites query (needs prior u)",
+            "closure size delta + package diff (needs prior u)",
         ),
         Line::from(Span::styled(
             "              badges: ✓ up-to-date   ↑ behind   ! error   ? unchecked   - n/a   ⠋ checking",
