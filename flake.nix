@@ -62,7 +62,7 @@
 
           # The TUI shells out to these at runtime.
           postInstall = ''
-            wrapProgram $out/bin/deploy-rs-tui \
+            wrapProgram $out/bin/deptui \
               --prefix PATH : ${
                 pkgs.lib.makeBinPath [
                   deploy-rs.packages.${system}.deploy-rs

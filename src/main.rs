@@ -12,7 +12,7 @@ use deploy_rs_tui::{app::App, flake, ui};
 
 /// CLI arguments. The TUI runs against a single flake reference.
 #[derive(Debug, Parser)]
-#[command(name = "deploy-rs-tui", version, about)]
+#[command(name = "deptui", version, about)]
 struct Cli {
     /// Path to the flake containing `deploy.nodes` (defaults to the current
     /// directory). Anything `nix` accepts as a flakeref works here too.

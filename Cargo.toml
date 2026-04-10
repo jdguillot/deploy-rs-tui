@@ -10,7 +10,7 @@ name = "deploy_rs_tui"
 path = "src/lib.rs"
 
 [[bin]]
-name = "deploy-rs-tui"
+name = "deptui"
 path = "src/main.rs"
 
 [dependencies]
