@@ -20,9 +20,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::app::{
-    App, FocusPane, InputMode, LastDeploy, OverrideField, COMMANDS, TOGGLE_COUNT,
-};
+use crate::app::{App, FocusPane, InputMode, LastDeploy, OverrideField, COMMANDS, TOGGLE_COUNT};
 use crate::deploy::{Mode, ProfileSel};
 use crate::host::{Reachability, UpdateState};
 
@@ -77,7 +75,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Toggles: single-row content, full width minus borders.
     let toggles_content_w = toggles_content_width();
     let toggles_inner_w = area.width.saturating_sub(2) as usize;
-    let toggles_height: u16 = if toggles_content_w > toggles_inner_w { 4 } else { 3 };
+    let toggles_height: u16 = if toggles_content_w > toggles_inner_w {
+        4
+    } else {
+        3
+    };
 
     // Commands row: two-column layout (40/60). Measure info +
     // commands independently and bump the whole strip if *either*
@@ -88,12 +90,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let cmd_inner_w = cmd_col_w.saturating_sub(2);
     let info_content_w = info_content_width(app);
     let cmd_content_w = commands_content_width();
-    let commands_height: u16 =
-        if info_content_w > info_inner_w || cmd_content_w > cmd_inner_w {
-            4
-        } else {
-            3
-        };
+    let commands_height: u16 = if info_content_w > info_inner_w || cmd_content_w > cmd_inner_w {
+        4
+    } else {
+        3
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -232,20 +233,12 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
             // probes use so a reachability refresh visually matches the
             // `u` refresh (the user asked for parity).
             let reach = if status.checking_reachability {
-                let frame = SPINNER_FRAMES
-                    [(app.tick_counter as usize) % SPINNER_FRAMES.len()];
-                Span::styled(
-                    frame.to_string(),
-                    Style::default().fg(Color::Cyan),
-                )
+                let frame = SPINNER_FRAMES[(app.tick_counter as usize) % SPINNER_FRAMES.len()];
+                Span::styled(frame.to_string(), Style::default().fg(Color::Cyan))
             } else {
                 match status.reachability {
-                    Reachability::Online => {
-                        Span::styled("●", Style::default().fg(Color::Green))
-                    }
-                    Reachability::Offline => {
-                        Span::styled("●", Style::default().fg(Color::Red))
-                    }
+                    Reachability::Online => Span::styled("●", Style::default().fg(Color::Green)),
+                    Reachability::Offline => Span::styled("●", Style::default().fg(Color::Red)),
                     Reachability::Unknown => {
                         Span::styled("●", Style::default().fg(Color::DarkGray))
                     }
@@ -377,9 +370,14 @@ fn focus_title_style(focused: bool) -> Style {
 /// prefixed as `[l] label`.
 fn pane_title_spans(label: &str, jump: char, focused: bool) -> Vec<Span<'static>> {
     let base = focus_title_style(focused);
-    let hot = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD | if focused { Modifier::REVERSED } else { Modifier::empty() });
+    let hot = Style::default().fg(Color::Yellow).add_modifier(
+        Modifier::BOLD
+            | if focused {
+                Modifier::REVERSED
+            } else {
+                Modifier::empty()
+            },
+    );
     // Find the first matching letter inside `label` so the title reads
     // naturally (e.g. "[h]osts" rather than "[h] hosts").
     if let Some(idx) = label
@@ -560,17 +558,13 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
             meta.push(Span::raw("  "));
         }
         if extra.checking_size {
-            let frame_ch =
-                SPINNER_FRAMES[(app.tick_counter as usize) % SPINNER_FRAMES.len()];
+            let frame_ch = SPINNER_FRAMES[(app.tick_counter as usize) % SPINNER_FRAMES.len()];
             meta.push(Span::styled(
                 format!("size {frame_ch}"),
                 Style::default().fg(Color::Cyan),
             ));
         } else if let (Some(local), Some(remote)) = (extra.local_size, extra.remote_size) {
-            meta.push(Span::styled(
-                "size ",
-                Style::default().fg(Color::DarkGray),
-            ));
+            meta.push(Span::styled("size ", Style::default().fg(Color::DarkGray)));
             meta.push(size_delta_span(local, remote));
         } else {
             meta.push(Span::styled(
@@ -588,8 +582,7 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
         // the actual log breathe and avoids two competing views of
         // the same data.
         if extra.checking_pkg {
-            let frame_ch =
-                SPINNER_FRAMES[(app.tick_counter as usize) % SPINNER_FRAMES.len()];
+            let frame_ch = SPINNER_FRAMES[(app.tick_counter as usize) % SPINNER_FRAMES.len()];
             lines.push(Line::from(vec![
                 Span::raw("       "),
                 Span::styled(
@@ -601,9 +594,29 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
             if diff.is_empty() {
                 lines.push(Line::from(vec![
                     Span::raw("       "),
+                    Span::styled("packages identical", Style::default().fg(Color::Green)),
+                ]));
+            } else if diff.trim_start().starts_with("(content-only)") {
+                // Content-only case: every package name+version
+                // matches on both sides but the actual store paths
+                // still differ. `check_package_diff` tags the
+                // leading line with `(content-only)` so we can
+                // recognise it here and render a distinct badge
+                // instead of the "N changes" version — otherwise
+                // the user sees a package count that doesn't match
+                // what the job log is showing (all path lines, no
+                // version changes).
+                lines.push(Line::from(vec![
+                    Span::raw("       "),
                     Span::styled(
-                        "packages identical",
-                        Style::default().fg(Color::Green),
+                        "packages identical, content differs",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "  see job log for paths",
+                        Style::default().fg(Color::DarkGray),
                     ),
                 ]));
             } else {
@@ -629,7 +642,7 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![
                 Span::raw("       "),
                 Span::styled(
-                    "packages ?  (p)",
+                    "packages ?  (Shift+U)",
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
@@ -663,20 +676,26 @@ fn short_hash_span(label: &'static str, path: Option<&str>) -> Span<'static> {
 }
 
 /// Humanised closure size delta: `+42.3 MiB` / `-7.0 MiB` / `±0 B`.
-/// Coloured by direction (green shrinking, yellow growing).
+/// Zero delta renders green (same bytes — safe), any non-zero delta
+/// renders yellow so the user's eye catches the "something changed"
+/// state whether the closure grew or shrank.
 fn size_delta_span(local: u64, remote: u64) -> Span<'static> {
-    let (delta_abs, sign, color) = if local >= remote {
-        (local - remote, '+', Color::Yellow)
+    let (delta_abs, sign) = if local >= remote {
+        (local - remote, '+')
     } else {
-        (remote - local, '-', Color::Green)
+        (remote - local, '-')
     };
-    let formatted = humanise_bytes(delta_abs);
+    let color = if delta_abs == 0 {
+        Color::Green
+    } else {
+        Color::Yellow
+    };
     let text = if delta_abs == 0 {
         format!("{} (unchanged)", humanise_bytes(local))
     } else {
+        let formatted = humanise_bytes(delta_abs);
         format!(
-            "{} (local {}, remote {})",
-            format!("{sign}{formatted}"),
+            "{sign}{formatted} (local {}, remote {})",
             humanise_bytes(local),
             humanise_bytes(remote),
         )
@@ -747,13 +766,7 @@ fn draw_node_summary(frame: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("profiles ", Style::default().fg(Color::DarkGray)),
-            Span::raw(
-                node.profiles
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ),
+            Span::raw(node.profiles.keys().cloned().collect::<Vec<_>>().join(", ")),
         ]),
         Line::from(vec![
             Span::styled("status   ", Style::default().fg(Color::DarkGray)),
@@ -781,10 +794,7 @@ fn draw_node_summary(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled("last up  ", Style::default().fg(Color::DarkGray)),
             match status.last_online {
-                Some(t) => Span::styled(
-                    format_time_ago(t),
-                    Style::default().fg(Color::Green),
-                ),
+                Some(t) => Span::styled(format_time_ago(t), Style::default().fg(Color::Green)),
                 None => Span::styled("(never seen)", Style::default().fg(Color::DarkGray)),
             },
         ]),
@@ -822,7 +832,10 @@ fn draw_node_summary(frame: &mut Frame, area: Rect, app: &App) {
             ]),
             (None, None) => Line::from(vec![
                 Span::styled("last     ", Style::default().fg(Color::DarkGray)),
-                Span::styled("(no deploy this session)", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "(no deploy this session)",
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]),
         },
     ];
@@ -902,8 +915,7 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let width = job_log_prefix_width(app);
-    let tagged: Vec<&crate::app::LogEntry> =
-        app.log.iter().filter(|e| e.host.is_some()).collect();
+    let tagged: Vec<&crate::app::LogEntry> = app.log.iter().filter(|e| e.host.is_some()).collect();
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -921,20 +933,10 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    // Clamp entry-based scroll so holding `k` past the oldest entry
-    // doesn't accumulate phantom offset that later has to be unwound
-    // with `j`. The max is "all but one entry scrolled off" because
-    // wrapping makes a strict row-anchored max hard to compute here
-    // — `scroll = total - 1` guarantees the oldest entry is still
-    // reachable from the current row offset.
-    let total = tagged.len();
-    let max_entry_scroll = total.saturating_sub(1);
-    if app.job_log_scroll > max_entry_scroll {
-        app.job_log_scroll = max_entry_scroll;
-    }
-    let scroll = app.job_log_scroll;
-
-    let query = if matches!(app.log_search_target, Some(crate::app::SearchTarget::JobLog)) {
+    let query = if matches!(
+        app.log_search_target,
+        Some(crate::app::SearchTarget::JobLog)
+    ) {
         app.log_search.as_deref()
     } else {
         None
@@ -967,8 +969,8 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
         .collect();
 
     let visible = inner.height as usize;
-    let (y_offset, _max_row_offset) =
-        compute_tail_scroll_offset(&all_lines, scroll, inner.width, visible);
+    let y_offset =
+        compute_tail_scroll_offset(&all_lines, &mut app.job_log_scroll, inner.width, visible);
 
     frame.render_widget(
         Paragraph::new(all_lines)
@@ -980,39 +982,75 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
 
 /// Turn an *entry-based* scroll offset into a *row-based* paragraph
 /// scroll offset so wrapped content anchors against the bottom of
-/// `inner`. Shared by both log panes. Returns `(y_offset, max_row_offset)`
-/// — the second component is handed back so the caller can clamp user
-/// state against it if desired.
+/// `inner`. Shared by both log panes. Clamps `scroll` in place so
+/// the caller's stored scroll state never exceeds the smallest
+/// value that produces `y_offset == 0` — otherwise holding `k` past
+/// the top would accumulate phantom entry counts that the `[↑N]`
+/// chip would happily display, without any visual movement in the
+/// pane. Returns the resulting `y_offset` (in physical rows).
 ///
-/// The trick: we measure the total wrapped-row count of the full
-/// line list via `Paragraph::line_count(width)`, and also measure
-/// how many rows the "scrolled-off" tail entries would occupy (the
-/// last `scroll` entries). Subtracting both from `max_row_offset`
-/// gives a paragraph-scroll value that places the tail flush with
-/// the bottom edge when `scroll == 0`.
+/// Implementation: measure each line's wrapped row count once, then
+/// walk from the tail summing row counts. The smallest `scroll`
+/// whose cumulative tail-rows reach `max_row_offset` is the useful
+/// cap — beyond that we'd be asking the Paragraph to scroll past
+/// its own top.
 fn compute_tail_scroll_offset(
     all_lines: &[Line<'_>],
-    scroll: usize,
+    scroll: &mut usize,
     width: u16,
     visible: usize,
-) -> (u16, usize) {
+) -> u16 {
     if all_lines.is_empty() || width == 0 {
-        return (0, 0);
+        *scroll = 0;
+        return 0;
     }
-    let total_rows = Paragraph::new(all_lines.to_vec())
-        .wrap(Wrap { trim: false })
-        .line_count(width);
+    // Per-entry wrapped row counts. Measuring each line on its own
+    // is an approximation for lines that interact via word-wrap
+    // across Text boundaries, but since every filtered entry is its
+    // own `Line` already, the Paragraph won't merge them — the sum
+    // matches what the full paragraph would report.
+    let per_entry_rows: Vec<usize> = all_lines
+        .iter()
+        .map(|line| {
+            Paragraph::new(vec![line.clone()])
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+                .max(1)
+        })
+        .collect();
+    let total_rows: usize = per_entry_rows.iter().sum();
     let max_row_offset = total_rows.saturating_sub(visible);
-    let row_scroll = if scroll == 0 {
+
+    // Walk the tail until cumulative rows meet max_row_offset — the
+    // first tail-slice that pushes enough rows off the bottom is the
+    // smallest `scroll` that pins the pane against its top. Anything
+    // larger collapses to the same visual state, so we cap there.
+    let mut cap = 0usize;
+    let mut acc = 0usize;
+    if max_row_offset > 0 {
+        for (i, r) in per_entry_rows.iter().enumerate().rev() {
+            acc += r;
+            cap = per_entry_rows.len() - i;
+            if acc >= max_row_offset {
+                break;
+            }
+        }
+    }
+    if *scroll > cap {
+        *scroll = cap;
+    }
+
+    // Row offset = (max pushed rows) − (rows actually pushed by the
+    // current tail slice). When scroll == 0 this anchors the tail
+    // flush with the bottom edge.
+    let row_scroll: usize = if *scroll == 0 {
         0
     } else {
-        let tail_start = all_lines.len().saturating_sub(scroll);
-        Paragraph::new(all_lines[tail_start..].to_vec())
-            .wrap(Wrap { trim: false })
-            .line_count(width)
+        let tail_start = per_entry_rows.len().saturating_sub(*scroll);
+        per_entry_rows[tail_start..].iter().sum()
     };
     let y = max_row_offset.saturating_sub(row_scroll);
-    (y.min(u16::MAX as usize) as u16, max_row_offset)
+    y.min(u16::MAX as usize) as u16
 }
 
 fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -1034,17 +1072,6 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    // Clamp entry-based scroll against an entry-count cap so holding
-    // `k` past the oldest entry doesn't accumulate phantom offset —
-    // same rationale as `draw_job_log`. The row-count math for the
-    // actual bottom-anchored offset happens below in
-    // `compute_tail_scroll_offset`.
-    let total = filtered.len();
-    let max_entry_scroll = total.saturating_sub(1);
-    if app.log_scroll > max_entry_scroll {
-        app.log_scroll = max_entry_scroll;
-    }
-    let scroll = app.log_scroll;
     let query = if matches!(
         app.log_search_target,
         Some(crate::app::SearchTarget::DetailsLog)
@@ -1073,8 +1100,7 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
     let visible = area.height as usize;
-    let (y_offset, _max_row_offset) =
-        compute_tail_scroll_offset(&all_lines, scroll, area.width, visible);
+    let y_offset = compute_tail_scroll_offset(&all_lines, &mut app.log_scroll, area.width, visible);
     frame.render_widget(
         Paragraph::new(all_lines)
             .wrap(Wrap { trim: false })
@@ -1087,11 +1113,7 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
 /// (when present) with a yellow background. The non-matching segments
 /// keep `base_style`. When `query` is `None` or empty we return a
 /// single span with `base_style` so callers don't have to special-case.
-fn highlight_match(
-    text: &str,
-    query: Option<&str>,
-    base_style: Style,
-) -> Vec<Span<'static>> {
+fn highlight_match(text: &str, query: Option<&str>, base_style: Style) -> Vec<Span<'static>> {
     let Some(q) = query.filter(|q| !q.is_empty()) else {
         return vec![Span::styled(text.to_string(), base_style)];
     };
@@ -1179,7 +1201,11 @@ fn build_toggles_spans(app: &App, focused: bool) -> Vec<Span<'static>> {
     // When the toggles pane has focus, the currently-navigated toggle
     // gets a reverse-video highlight so the user knows which one
     // Enter will flip.
-    let sub = if focused { Some(app.toggle_index) } else { None };
+    let sub = if focused {
+        Some(app.toggle_index)
+    } else {
+        None
+    };
     let values = [
         ("1", "skip-checks", t.skip_checks),
         ("2", "magic-rb", t.magic_rollback),
@@ -1205,7 +1231,13 @@ fn build_toggles_spans(app: &App, focused: bool) -> Vec<Span<'static>> {
 fn toggles_content_width() -> usize {
     // Values deliberately match `build_toggles_spans`'s label list;
     // if a label ever grows here, bump it there too.
-    let labels = ["skip-checks", "magic-rb", "auto-rb", "remote-build", "int-sudo"];
+    let labels = [
+        "skip-checks",
+        "magic-rb",
+        "auto-rb",
+        "remote-build",
+        "int-sudo",
+    ];
     // Each toggle renders as ` <key>:<icon> <label> ` = 6 fixed chars
     // + label; plus a 2-char separator between toggles and a leading
     // space.
@@ -1322,11 +1354,8 @@ fn info_hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
             ("q", "quit"),
         ],
         FocusPane::Details | FocusPane::JobLog => {
-            let mut v: Vec<(&'static str, &'static str)> = vec![
-                ("j/k", "scroll"),
-                ("g/G", "top/tail"),
-                ("/", "search"),
-            ];
+            let mut v: Vec<(&'static str, &'static str)> =
+                vec![("j/k", "scroll"), ("g/G", "top/tail"), ("/", "search")];
             if search_active_here {
                 v.push(("n/N", "next/prev"));
                 v.push(("Esc", "clear"));
@@ -1375,7 +1404,11 @@ fn info_content_width(app: &App) -> usize {
 /// `draw_commands_row` for the same width-measurement reason as
 /// `build_toggles_spans`.
 fn build_commands_spans(app: &App, focused: bool) -> Vec<Span<'static>> {
-    let sub = if focused { Some(app.command_index) } else { None };
+    let sub = if focused {
+        Some(app.command_index)
+    } else {
+        None
+    };
     let mut spans: Vec<Span> = Vec::with_capacity(COMMANDS.len() * 3 + 1);
     spans.push(Span::raw(" "));
     for (i, (_cmd, key, label)) in COMMANDS.iter().enumerate() {
@@ -1432,7 +1465,6 @@ fn command_button(key: &'static str, label: &'static str, focused: bool) -> [Spa
         Span::styled(format!("{label} "), label_style),
     ]
 }
-
 
 /// Bottom input strip: renders prompt text when the user is mid-input
 /// (override menu, edit field, confirm popup, etc.) and is left blank
@@ -1585,9 +1617,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
 
     // Title swaps in a `/` reminder when no filter is active so the
     // user discovers the feature.
-    let title = if app.help_search.is_some()
-        || matches!(app.input, InputMode::SearchHelp { .. })
-    {
+    let title = if app.help_search.is_some() || matches!(app.input, InputMode::SearchHelp { .. }) {
         " help — ? / Esc close · / filter ".bold()
     } else {
         " help — ? / Esc close · j/k scroll · / filter ".bold()
@@ -1732,8 +1762,8 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
     // whenever filtering is active OR the user is mid-type. Keeps the
     // input visible inside the popup itself rather than only on the
     // app-level input strip.
-    let show_search_row = matches!(app.input, InputMode::SearchHelp { .. })
-        || app.help_search.is_some();
+    let show_search_row =
+        matches!(app.input, InputMode::SearchHelp { .. }) || app.help_search.is_some();
     let (content_area, search_area) = if show_search_row {
         let rows = Layout::default()
             .direction(Direction::Vertical)
@@ -1752,8 +1782,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         all_lines
             .into_iter()
             .filter(|line| {
-                let text: String =
-                    line.spans.iter().map(|s| s.content.as_ref()).collect();
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                 text.is_empty() || text.contains(q)
             })
             .collect()

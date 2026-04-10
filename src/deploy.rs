@@ -96,7 +96,12 @@ pub struct DeployRequest {
 
 impl DeployRequest {
     fn target(&self) -> String {
-        format!("{}#{}{}", self.flake, self.node, self.profile.target_suffix())
+        format!(
+            "{}#{}{}",
+            self.flake,
+            self.node,
+            self.profile.target_suffix()
+        )
     }
 }
 
@@ -192,7 +197,11 @@ async fn run_inner(req: DeployRequest, tx: mpsc::Sender<LogLine>) -> Result<()> 
     let stdout_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = reader.next_line().await {
-            if tx_out.send(LogLine::Stdout(line)).await.is_err() {
+            if tx_out
+                .send(LogLine::Stdout(strip_ansi(&line)))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -202,7 +211,11 @@ async fn run_inner(req: DeployRequest, tx: mpsc::Sender<LogLine>) -> Result<()> 
     let stderr_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
-            if tx_err.send(LogLine::Stderr(line)).await.is_err() {
+            if tx_err
+                .send(LogLine::Stderr(strip_ansi(&line)))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -215,4 +228,122 @@ async fn run_inner(req: DeployRequest, tx: mpsc::Sender<LogLine>) -> Result<()> 
     let code = status.code().unwrap_or(-1);
     let _ = tx.send(LogLine::Exit(code)).await;
     Ok(())
+}
+
+/// Remove ANSI terminal control sequences from a captured line.
+///
+/// `NO_COLOR=1` in the spawned environment tames `deploy-rs` itself,
+/// but the nested `nix` / `nix-daemon` / `ssh` children don't all
+/// honour it — in particular, remote `nix build` output that arrives
+/// through ssh carries SGR colour codes, OSC title updates, cursor
+/// moves, and the occasional raw ESC that ratatui's `Paragraph`
+/// widget will happily render as literal bytes. When those bytes mix
+/// into a `Line`, ratatui's width accounting drifts and individual
+/// characters get dropped from the visible text (the classic
+/// `dotfiles` → `dotf les` corruption).
+///
+/// We strip the common offenders here so every line that reaches the
+/// TUI is plain utf-8 text:
+///   - CSI sequences: `ESC [` … final byte in `0x40..=0x7e`
+///   - OSC sequences: `ESC ]` … terminated by `BEL` or `ESC \\`
+///   - Bare control bytes `\x00..=\x08`, `\x0b..=\x1f`, `\x7f`
+///     except `\t` (tab, 0x09), which we keep verbatim
+///
+/// Line endings are already stripped by the line-buffered reader.
+fn strip_ansi(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b {
+            // ESC — try to classify the sequence that follows.
+            if i + 1 >= bytes.len() {
+                i += 1;
+                continue;
+            }
+            match bytes[i + 1] {
+                // CSI: ESC [ params final
+                b'[' => {
+                    let mut j = i + 2;
+                    while j < bytes.len() {
+                        let c = bytes[j];
+                        if (0x40..=0x7e).contains(&c) {
+                            j += 1;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                }
+                // OSC: ESC ] … BEL | ESC \
+                b']' => {
+                    let mut j = i + 2;
+                    while j < bytes.len() {
+                        if bytes[j] == 0x07 {
+                            j += 1;
+                            break;
+                        }
+                        if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
+                            j += 2;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                }
+                // Two-byte escape: ESC <char>
+                _ => {
+                    i += 2;
+                }
+            }
+            continue;
+        }
+        // Keep tabs and printable bytes; drop other control bytes.
+        if b == b'\t' || b >= 0x20 && b != 0x7f {
+            // Push as many contiguous printable bytes as possible in
+            // one shot to keep the utf-8 sequences intact.
+            let start = i;
+            while i < bytes.len() {
+                let c = bytes[i];
+                if c == 0x1b || (c < 0x20 && c != b'\t') || c == 0x7f {
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(std::str::from_utf8(&bytes[start..i]).unwrap_or(""));
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn strips_csi_color_sequences() {
+        let input = "\x1b[38;5;120mhello\x1b[0m world";
+        assert_eq!(strip_ansi(input), "hello world");
+    }
+
+    #[test]
+    fn preserves_utf8_and_tabs() {
+        let input = "→ deploying\t/home/jdguillot/.dotfiles";
+        assert_eq!(strip_ansi(input), "→ deploying\t/home/jdguillot/.dotfiles");
+    }
+
+    #[test]
+    fn strips_osc_title_sequence() {
+        let input = "\x1b]0;title\x07after";
+        assert_eq!(strip_ansi(input), "after");
+    }
+
+    #[test]
+    fn strips_bare_esc_and_control_bytes() {
+        let input = "warn\x05ing \x1b ok\x7f";
+        assert_eq!(strip_ansi(input), "warning  ok");
+    }
 }

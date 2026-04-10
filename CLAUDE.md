@@ -75,10 +75,16 @@ Key invariants worth knowing before touching the code:
 - **`host::check_online` is the only "always-on" background work.** It
   runs once at startup and again on every `r` keypress. Everything more
   expensive (`u`, deploy itself) is lazy and user-triggered.
-- **`host::check_profile_up_to_date` strips `/activate`** from the
-  deploy-rs path before comparing, because the in-store closure path the
-  remote `/run/current-system` symlink resolves to is the parent
-  directory, not the `activate` script itself.
+- **`host::check_profile_up_to_date` resolves the deploy-rs wrapper
+  to its toplevel** before comparing against the remote's
+  `/run/current-system`. Stripping `/activate` alone isn't enough —
+  that yields the activation *wrapper* (e.g.
+  `…-nixos-system-<host>-…-activate-path`), whose store hash differs
+  from the toplevel (`…-nixos-system-<host>-…`) the remote symlink
+  actually points at. The wrapper's direct references include the
+  toplevel; `resolve_local_toplevel_quiet` picks it out by parsed
+  name match. The fallback `parsed_paths_equivalent` compares
+  `<name, version>` pairs when the wrapper isn't in the local store.
 - **`app::App::run` is one `tokio::select!`** over three sources: term
   events, background status updates, and live deploy log lines. The
   optional deploy receiver is handled with `recv_optional`, which yields

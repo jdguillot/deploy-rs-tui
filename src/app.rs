@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use crate::deploy::{self, DeployRequest, LogLine, Mode, ProfileSel, Toggles};
 use crate::event::{spawn as spawn_events, AppEvent};
 use crate::flake::Node;
-use crate::host::{self, HostStatus, ProfileCheck, Reachability, UpdateState};
+use crate::host::{self, HostStatus, ProfileCheck, ProfileExtra, Reachability, UpdateState};
 use crate::ssh::SshOverride;
 use crate::ui::{self, Tui};
 
@@ -153,7 +153,10 @@ pub enum InputMode {
     /// clear). Single-key sub-menu.
     OverridesMenu,
     /// User is typing into a single-line text buffer for `field`.
-    EditOverride { field: OverrideField, buf: String },
+    EditOverride {
+        field: OverrideField,
+        buf: String,
+    },
     /// Picking an SSH identity file. The user can either pick one of the
     /// scanned `entries` with Ctrl+J/K or type a custom path into `buf`.
     /// `entries` may be empty if `~/.ssh` couldn't be read or had no
@@ -176,12 +179,17 @@ pub enum InputMode {
     /// jumps to the nearest match), Esc cancels (search cleared).
     /// While in this mode `n`/`Shift+N` are still typed into the buf —
     /// they only become "next match" / "previous match" after Enter.
-    SearchLog { target: SearchTarget, buf: String },
+    SearchLog {
+        target: SearchTarget,
+        buf: String,
+    },
     /// User pressed `/` while the help popup was open and is typing a
     /// filter. Lazygit-style: lines that don't contain the buf are
     /// hidden as the user types. Enter commits the filter, Esc clears
     /// it. The popup stays open the whole time.
-    SearchHelp { buf: String },
+    SearchHelp {
+        buf: String,
+    },
 }
 
 /// What we remember about the most recently completed deploy. Rendered
@@ -489,10 +497,7 @@ impl App {
                     self.input = InputMode::SearchHelp { buf: String::new() };
                     return;
                 }
-                KeyCode::Char('?')
-                | KeyCode::Esc
-                | KeyCode::Enter
-                | KeyCode::Char('q') => {
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                     self.show_help = false;
                     // Reset so the next `?` lands at the top again.
                     self.help_scroll = 0;
@@ -865,11 +870,6 @@ impl App {
             KeyCode::Char('d') => self.request_deploy(Mode::DryRun),
             KeyCode::Char('x') => self.cancel_deploy(),
 
-            // Expensive-tier update details: full package diff.
-            // Behind lowercase `p` to keep the cheap/medium/expensive
-            // tiers evaluable independently.
-            KeyCode::Char('p') => self.refresh_pkg_diff_for_selected(),
-
             // Toggles by direct number key.
             KeyCode::Char('1') => self.activate_toggle(0),
             KeyCode::Char('2') => self.activate_toggle(1),
@@ -952,8 +952,7 @@ impl App {
             return;
         }
         let len = COMMANDS.len() as i32;
-        self.command_index =
-            ((self.command_index as i32 + delta).rem_euclid(len)) as usize;
+        self.command_index = ((self.command_index as i32 + delta).rem_euclid(len)) as usize;
     }
 
     /// Flip the toggle at `idx`. `idx` is expected to be `0..TOGGLE_COUNT`
@@ -1077,12 +1076,7 @@ impl App {
         self.input = InputMode::EditOverride { field, buf };
     }
 
-    fn handle_key_edit_override(
-        &mut self,
-        key: KeyEvent,
-        field: OverrideField,
-        mut buf: String,
-    ) {
+    fn handle_key_edit_override(&mut self, key: KeyEvent, field: OverrideField, mut buf: String) {
         match key.code {
             KeyCode::Esc => {
                 self.input = InputMode::Normal;
@@ -1094,7 +1088,11 @@ impl App {
                 };
                 let trimmed = buf.trim().to_string();
                 let entry = self.override_mut(&node_name);
-                let value: Option<String> = if trimmed.is_empty() { None } else { Some(trimmed) };
+                let value: Option<String> = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
                 match field {
                     OverrideField::Hostname => entry.hostname = value.clone(),
                     OverrideField::User => entry.user = value.clone(),
@@ -1146,9 +1144,8 @@ impl App {
         // scanned key list. Moving the highlight syncs `buf` so Enter
         // saves the highlighted path with no extra step. Plain typing
         // overrides the buffer freely so a custom path always wins.
-        let nav_down =
-            (ctrl && matches!(key.code, KeyCode::Char('j') | KeyCode::Char('J')))
-                || matches!(key.code, KeyCode::Down);
+        let nav_down = (ctrl && matches!(key.code, KeyCode::Char('j') | KeyCode::Char('J')))
+            || matches!(key.code, KeyCode::Down);
         let nav_up = (ctrl && matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K')))
             || matches!(key.code, KeyCode::Up);
         if !entries.is_empty() && (nav_down || nav_up) {
@@ -1234,10 +1231,7 @@ impl App {
                 self.input = InputMode::Normal;
                 self.run_confirmed(hosts, mode, profile);
             }
-            KeyCode::Char('n')
-            | KeyCode::Char('N')
-            | KeyCode::Esc
-            | KeyCode::Char('q') => {
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.input = InputMode::Normal;
                 self.push_log("• deploy cancelled at confirmation", false);
             }
@@ -1257,12 +1251,7 @@ impl App {
     /// for one of the log panes. Enter commits, Esc cancels (clearing
     /// any prior committed search), Backspace edits, every other
     /// printable char appends to the buffer.
-    fn handle_key_search_log(
-        &mut self,
-        key: KeyEvent,
-        target: SearchTarget,
-        mut buf: String,
-    ) {
+    fn handle_key_search_log(&mut self, key: KeyEvent, target: SearchTarget, mut buf: String) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => {
@@ -1458,12 +1447,8 @@ impl App {
             return (0, 0);
         }
         let (filtered, scroll) = match target {
-            SearchTarget::DetailsLog => {
-                (self.filtered_log_indices_for_details(), self.log_scroll)
-            }
-            SearchTarget::JobLog => {
-                (self.filtered_log_indices_for_job_log(), self.job_log_scroll)
-            }
+            SearchTarget::DetailsLog => (self.filtered_log_indices_for_details(), self.log_scroll),
+            SearchTarget::JobLog => (self.filtered_log_indices_for_job_log(), self.job_log_scroll),
         };
         if filtered.is_empty() {
             return (0, 0);
@@ -1727,10 +1712,9 @@ impl App {
             let override_ = override_.clone();
             let tx = self.status_tx.clone();
             let handle = tokio::spawn(async move {
-                let result =
-                    host::check_profile_up_to_date(&flake, &node, &profile, &override_)
-                        .await
-                        .map_err(|e| format!("{e:#}"));
+                let result = host::check_profile_up_to_date(&flake, &node, &profile, &override_)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
                 let _ = tx
                     .send(StatusUpdate::UpdateProbe {
                         node: node.name.clone(),
@@ -1774,7 +1758,11 @@ impl App {
                     "home" => &status.home_extra,
                     _ => return (p.clone(), None, None),
                 };
-                (p.clone(), extra.local_path.clone(), extra.remote_path.clone())
+                (
+                    p.clone(),
+                    extra.local_path.clone(),
+                    extra.remote_path.clone(),
+                )
             })
             .collect();
         for (profile, local, remote) in profiles {
@@ -1801,8 +1789,7 @@ impl App {
                 // each one to a LogLine tagged with the node name so
                 // it lands in that host's details log alongside the
                 // spinner.
-                let (prog_tx, mut prog_rx) =
-                    mpsc::channel::<String>(64);
+                let (prog_tx, mut prog_rx) = mpsc::channel::<String>(64);
                 let forwarder_tx = tx.clone();
                 let forwarder_node = node_cloned.name.clone();
                 let forwarder = tokio::spawn(async move {
@@ -1857,111 +1844,83 @@ impl App {
         }
     }
 
-    /// Expensive-tier update details: full `nix store diff-closures`
-    /// output. Same cached-paths precondition as `refresh_sizes_for_selected`.
-    fn refresh_pkg_diff_for_selected(&mut self) {
-        let targets = self.target_nodes();
-        if targets.is_empty() {
-            return;
+    /// Expensive-tier update details: full package diff for a single
+    /// `(node, profile)` pair. Called automatically from the size
+    /// probe's Ok branch so `Shift+U` transparently chains into the
+    /// package diff once the cached paths are known to be good —
+    /// there's no separate key for it.
+    ///
+    /// `local_path`/`remote_path` are forwarded so the caller can
+    /// pass the exact paths the size probe was measuring, avoiding a
+    /// second lookup through the extras map (which could race with a
+    /// subsequent `u`).
+    fn spawn_pkg_diff_for_profile(
+        &mut self,
+        node: &Node,
+        profile: &str,
+        local_path: String,
+        remote_path: String,
+    ) {
+        let entry = self.status.entry(node.name.clone()).or_default();
+        match profile {
+            "system" => entry.system_extra.checking_pkg = true,
+            "home" => entry.home_extra.checking_pkg = true,
+            _ => return,
         }
-        for node in targets {
-            self.refresh_pkg_diff_for_node(&node);
-        }
-    }
-
-    fn refresh_pkg_diff_for_node(&mut self, node: &Node) {
-        let status = self.status.entry(node.name.clone()).or_default();
-        let profiles: Vec<(String, Option<String>, Option<String>)> = node
-            .profiles
-            .keys()
-            .map(|p| {
-                let extra = match p.as_str() {
-                    "system" => &status.system_extra,
-                    "home" => &status.home_extra,
-                    _ => return (p.clone(), None, None),
-                };
-                (p.clone(), extra.local_path.clone(), extra.remote_path.clone())
-            })
-            .collect();
-        let mut launched = 0usize;
-        for (profile, local, remote) in profiles {
-            let (Some(local_path), Some(remote_path)) = (local, remote) else {
-                continue;
-            };
-            let entry = self.status.entry(node.name.clone()).or_default();
-            match profile.as_str() {
-                "system" => entry.system_extra.checking_pkg = true,
-                "home" => entry.home_extra.checking_pkg = true,
-                _ => {}
-            }
-            let tx = self.status_tx.clone();
-            let node_cloned = node.clone();
-            let profile_cloned = profile.clone();
-            let override_ = self.override_for(&node.name).clone();
-            let flake_cloned = self.flake.clone();
-            let handle = tokio::spawn(async move {
-                // Bridge: host::check_package_diff emits free-form
-                // progress strings; we forward each one as a LogLine
-                // status update tagged with the node name so it lands
-                // in the host's details log alongside the spinner.
-                // The bridge task ends naturally when the sender side
-                // is dropped at function exit.
-                let (prog_tx, mut prog_rx) =
-                    mpsc::channel::<String>(64);
-                let forwarder_tx = tx.clone();
-                let forwarder_node = node_cloned.name.clone();
-                let forwarder = tokio::spawn(async move {
-                    while let Some(line) = prog_rx.recv().await {
-                        let _ = forwarder_tx
-                            .send(StatusUpdate::LogLine {
-                                node: forwarder_node.clone(),
-                                text: line,
-                                is_err: false,
-                            })
-                            .await;
-                    }
-                });
-
-                let result = host::check_package_diff(
-                    &flake_cloned,
-                    &node_cloned,
-                    &profile_cloned,
-                    &local_path,
-                    &remote_path,
-                    &override_,
-                    prog_tx,
-                )
-                .await
-                .map_err(|e| format!("{e:#}"));
-                // Make sure the forwarder drains anything still in
-                // flight before we publish the final probe result, so
-                // the user sees the closing "[pkg] done" line before
-                // the inline diff snaps into place.
-                let _ = forwarder.await;
-                let _ = tx
-                    .send(StatusUpdate::PkgDiffProbe {
-                        node: node_cloned.name.clone(),
-                        profile: profile_cloned,
-                        result,
-                    })
-                    .await;
+        let tx = self.status_tx.clone();
+        let node_cloned = node.clone();
+        let profile_cloned = profile.to_string();
+        let override_ = self.override_for(&node.name).clone();
+        let flake_cloned = self.flake.clone();
+        let handle = tokio::spawn(async move {
+            // Bridge: host::check_package_diff emits free-form
+            // progress strings; forward each one as a LogLine tagged
+            // with the node name so it lands in the host's details
+            // log alongside the spinner.
+            let (prog_tx, mut prog_rx) = mpsc::channel::<String>(64);
+            let forwarder_tx = tx.clone();
+            let forwarder_node = node_cloned.name.clone();
+            let forwarder = tokio::spawn(async move {
+                while let Some(line) = prog_rx.recv().await {
+                    let _ = forwarder_tx
+                        .send(StatusUpdate::LogLine {
+                            node: forwarder_node.clone(),
+                            text: line,
+                            is_err: false,
+                        })
+                        .await;
+                }
             });
-            self.track_probe(handle);
-            launched += 1;
-        }
-        if launched == 0 {
-            self.push_log_tagged(
-                format!("! no cached paths for {} — press u first", node.name).as_str(),
-                true,
-                Some(node.name.clone()),
-            );
-        } else {
-            self.push_log_tagged(
-                format!("→ computing package diff for {}", node.name).as_str(),
-                false,
-                Some(node.name.clone()),
-            );
-        }
+
+            let result = host::check_package_diff(
+                &flake_cloned,
+                &node_cloned,
+                &profile_cloned,
+                &local_path,
+                &remote_path,
+                &override_,
+                prog_tx,
+            )
+            .await
+            .map_err(|e| format!("{e:#}"));
+            // Drain the forwarder before publishing the final probe
+            // result so the closing "[pkg] done" line lands before
+            // the inline diff snaps into place.
+            let _ = forwarder.await;
+            let _ = tx
+                .send(StatusUpdate::PkgDiffProbe {
+                    node: node_cloned.name.clone(),
+                    profile: profile_cloned,
+                    result,
+                })
+                .await;
+        });
+        self.track_probe(handle);
+        self.push_log_tagged(
+            format!("→ computing package diff for {} ({profile})", node.name).as_str(),
+            false,
+            Some(node.name.clone()),
+        );
     }
 
     fn apply_status(&mut self, update: StatusUpdate) {
@@ -2008,6 +1967,15 @@ impl App {
                             ex.local_path = Some(c.local_path.clone());
                             ex.remote_path = Some(c.remote_path.clone());
                             ex.activation_time = c.activation_time;
+                            // A fresh `u` invalidates the medium/expensive
+                            // tiers — the closure we just resolved may
+                            // not be the one we sized / diffed last
+                            // time. Clear them so the user re-triggers
+                            // Shift+U / p against the new paths instead
+                            // of reading stale numbers as current.
+                            ex.local_size = None;
+                            ex.remote_size = None;
+                            ex.pkg_diff = None;
                         }
                         Err(_) => {
                             ex.local_path = None;
@@ -2040,7 +2008,14 @@ impl App {
                 profile,
                 result,
             } => {
-                let entry = self.status.entry(node).or_default();
+                // Snapshot the paths we'll hand to the auto-chained
+                // package diff below so we don't have to re-borrow
+                // `self.status` after the entry mutation. Same source
+                // the size probe just measured against — guarantees
+                // the diff looks at the closures whose sizes the
+                // user is currently reading.
+                let mut chain_paths: Option<(String, String)> = None;
+                let entry = self.status.entry(node.clone()).or_default();
                 let extra = match profile.as_str() {
                     "system" => Some(&mut entry.system_extra),
                     "home" => Some(&mut entry.home_extra),
@@ -2052,12 +2027,34 @@ impl App {
                         Ok((local, remote)) => {
                             ex.local_size = Some(local);
                             ex.remote_size = Some(remote);
+                            if let (Some(lp), Some(rp)) =
+                                (ex.local_path.clone(), ex.remote_path.clone())
+                            {
+                                chain_paths = Some((lp, rp));
+                            }
                         }
                         Err(e) => {
                             ex.local_size = None;
                             ex.remote_size = None;
                             entry.last_error = Some(e);
                         }
+                    }
+                }
+                // Auto-chain the package diff after a successful size
+                // probe — the old `p` keybind is gone; `Shift+U`
+                // implicitly performs both tiers back to back so the
+                // details pane ends up with the full picture without
+                // the user having to orchestrate it.
+                if let Some((local_path, remote_path)) = chain_paths {
+                    if let Some(node_obj) =
+                        self.nodes.iter().find(|n| n.name == node).cloned()
+                    {
+                        self.spawn_pkg_diff_for_profile(
+                            &node_obj,
+                            &profile,
+                            local_path,
+                            remote_path,
+                        );
                     }
                 }
             }
@@ -2083,11 +2080,7 @@ impl App {
                     }
                 }
             }
-            StatusUpdate::LogLine {
-                node,
-                text,
-                is_err,
-            } => {
+            StatusUpdate::LogLine { node, text, is_err } => {
                 self.push_log_tagged(&text, is_err, Some(node));
             }
         }
@@ -2099,10 +2092,7 @@ impl App {
     /// trouble to mark, that's what they want.
     fn request_deploy(&mut self, mode: Mode) {
         if self.deploy_task.is_some() {
-            self.push_log(
-                "! a deploy is already running — press x to cancel",
-                true,
-            );
+            self.push_log("! a deploy is already running — press x to cancel", true);
             return;
         }
         let hosts: Vec<String> = if self.marked.is_empty() {
@@ -2250,8 +2240,7 @@ impl App {
             let target = self.current_target.clone();
             if drained > 0 {
                 self.push_log_tagged(
-                    format!("! deploy cancelled — dropped {drained} queued host(s)")
-                        .as_str(),
+                    format!("! deploy cancelled — dropped {drained} queued host(s)").as_str(),
                     true,
                     target.clone(),
                 );
@@ -2275,8 +2264,7 @@ impl App {
             // No deploy was running but probes were — surface that so
             // the user gets feedback for their `x` press.
             self.push_log(
-                format!("! cancelled {probes_aborted} in-flight check(s)")
-                    .as_str(),
+                format!("! cancelled {probes_aborted} in-flight check(s)").as_str(),
                 true,
             );
         }
@@ -2351,9 +2339,16 @@ impl App {
                     if ok {
                         // Stale-update marks: a successful push
                         // invalidates the previously-cached probe.
+                        // Wipe the per-profile extras too — their
+                        // paths, sizes, and package diff were scoped
+                        // to the *previous* closure and would
+                        // otherwise linger in the details pane until
+                        // the user re-ran `u`/`U`/`p`.
                         if let Some(s) = self.status.get_mut(&name) {
                             s.system_update = UpdateState::Unknown;
                             s.home_update = UpdateState::Unknown;
+                            s.system_extra = ProfileExtra::default();
+                            s.home_extra = ProfileExtra::default();
                         }
                     }
                 }
@@ -2374,10 +2369,8 @@ impl App {
                     if dropped > 0 {
                         self.deploy_queue.clear();
                         self.push_log_tagged(
-                            format!(
-                                "! batch stopped after failure — {dropped} host(s) skipped"
-                            )
-                            .as_str(),
+                            format!("! batch stopped after failure — {dropped} host(s) skipped")
+                                .as_str(),
                             true,
                             exit_host,
                         );

@@ -115,12 +115,7 @@ pub struct ProfileExtra {
 pub async fn check_online(hostname: &str, override_: &SshOverride) -> Reachability {
     let (host, port) = resolve_ssh_endpoint(hostname, override_)
         .await
-        .unwrap_or_else(|| {
-            (
-                override_.effective_host(hostname).to_string(),
-                22,
-            )
-        });
+        .unwrap_or_else(|| (override_.effective_host(hostname).to_string(), 22));
     let target = format!("{host}:{port}");
     match timeout(Duration::from_secs(2), TcpStream::connect(&target)).await {
         Ok(Ok(_)) => Reachability::Online,
@@ -132,10 +127,7 @@ pub async fn check_online(hostname: &str, override_: &SshOverride) -> Reachabili
 /// `HostName` substitution, `Port`, all of it. Returns `None` if ssh
 /// isn't on PATH, the config can't be parsed, or the relevant lines are
 /// missing from the output.
-async fn resolve_ssh_endpoint(
-    hostname: &str,
-    override_: &SshOverride,
-) -> Option<(String, u16)> {
+async fn resolve_ssh_endpoint(hostname: &str, override_: &SshOverride) -> Option<(String, u16)> {
     let effective = override_.effective_host(hostname).to_string();
     let mut cmd = Command::new("ssh");
     cmd.arg("-G");
@@ -146,7 +138,10 @@ async fn resolve_ssh_endpoint(
         cmd.arg(arg);
     }
     cmd.arg(&effective);
-    let output = timeout(Duration::from_secs(2), cmd.output()).await.ok()?.ok()?;
+    let output = timeout(Duration::from_secs(2), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -208,9 +203,7 @@ pub async fn check_profile_up_to_date(
     // builds — staring the resolved path would always return "56
     // years ago". The symlink's mtime is the activation time.
     let remote_cmd = match profile {
-        "system" => {
-            "readlink -f /run/current-system && stat -c %Y /run/current-system".to_string()
-        }
+        "system" => "readlink -f /run/current-system && stat -c %Y /run/current-system".to_string(),
         "home" => {
             // Try the modern home-manager symlink first; fall back to
             // the legacy ~/.nix-profile. We pick whichever exists,
@@ -241,12 +234,98 @@ pub async fn check_profile_up_to_date(
         .map(|secs| std::time::UNIX_EPOCH + Duration::from_secs(secs));
 
     let local_trimmed = local.trim().to_string();
+
+    // `local_trimmed` is the deploy-rs activation *wrapper* path — its
+    // store hash is distinct from the toplevel that
+    // `/run/current-system` resolves to, so a naive string compare
+    // against `remote_path` would *always* say "needs update" even
+    // when the host is perfectly current. Resolve the wrapper to the
+    // toplevel it encloses and compare that instead. When the wrapper
+    // isn't in the local store (or the resolve otherwise fails) fall
+    // back to a parsed name+version equality check so we don't
+    // regress into the old false-positive behaviour.
+    let resolved_local = resolve_local_toplevel_quiet(&local_trimmed, &remote_path).await;
+    let up_to_date = match resolved_local.as_deref() {
+        Some(toplevel) => toplevel == remote_path,
+        None => parsed_paths_equivalent(&local_trimmed, &remote_path),
+    };
+    // Prefer reporting the resolved toplevel to downstream UI/probes:
+    // both the closure-size and package-diff tiers want the toplevel,
+    // not the wrapper. If we couldn't resolve, keep the wrapper so
+    // the expensive tiers can still run their own resolution.
+    let reported_local = resolved_local.unwrap_or(local_trimmed);
+
     Ok(ProfileCheck {
-        up_to_date: remote_path == local_trimmed,
-        local_path: local_trimmed,
+        up_to_date,
+        local_path: reported_local,
         remote_path,
         activation_time,
     })
+}
+
+/// Heuristic fallback for when we can't resolve the local wrapper to
+/// its toplevel (wrapper isn't in the local store yet, references
+/// unavailable, etc.). Parses `<hash>-<name>-<version>` from each
+/// basename and compares the pair after peeling any deploy-rs
+/// activation suffixes from the local side. Not as strict as a path
+/// equality check — two builds of the same package with different
+/// inputs can share a name+version but have different hashes — but
+/// matches the user's mental model of "same nixos-generation" and is
+/// strictly better than the raw-path compare it replaces.
+fn parsed_paths_equivalent(local_path: &str, remote_path: &str) -> bool {
+    let local_base = local_path.rsplit('/').next().unwrap_or(local_path);
+    let remote_base = remote_path.rsplit('/').next().unwrap_or(remote_path);
+    let (mut local_name, local_ver) = split_name_version(local_base);
+    let (remote_name, remote_ver) = split_name_version(remote_base);
+    for suffix in ["-activate-path", "-activate-rs"] {
+        if let Some(stripped) = local_name.strip_suffix(suffix) {
+            local_name = stripped.to_string();
+            break;
+        }
+    }
+    !local_name.is_empty()
+        && !local_ver.is_empty()
+        && local_name == remote_name
+        && local_ver == remote_ver
+}
+
+/// Progress-free twin of [`resolve_local_toplevel`]. The cheap-tier
+/// update check (`u`) runs on every profile of every targeted host,
+/// so it can't afford to thread an `mpsc::Sender` through; this
+/// version silently returns `None` on any failure (wrapper not in
+/// store, references unavailable, no match) and lets the caller pick
+/// a fallback.
+async fn resolve_local_toplevel_quiet(wrapper_path: &str, remote_path: &str) -> Option<String> {
+    let remote_base = remote_path.rsplit('/').next().unwrap_or(remote_path);
+    let (remote_name, _) = split_name_version(remote_base);
+    if remote_name.is_empty() {
+        return None;
+    }
+    if !std::path::Path::new(wrapper_path).exists() {
+        return None;
+    }
+    let out = Command::new("nix-store")
+        .args(["--query", "--references", wrapper_path])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let p = line.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let base = p.rsplit('/').next().unwrap_or(p);
+        let (name, _) = split_name_version(base);
+        if name == remote_name {
+            return Some(p.to_string());
+        }
+    }
+    None
 }
 
 /// Medium-tier check: closure size delta.
@@ -276,13 +355,11 @@ pub async fn check_closure_sizes(
 ) -> Result<(u64, u64)> {
     // Step 1: make sure the deploy-rs activation wrapper is in the
     // local store. Nothing to do if it already is.
-    ensure_local_closure(flake, &node.name, profile, local_path, &progress, "size")
-        .await?;
+    ensure_local_closure(flake, &node.name, profile, local_path, &progress, "size").await?;
     // Step 2: resolve the wrapper down to the actual toplevel so we
     // compare apples-to-apples with the remote's /run/current-system
     // target. See `resolve_local_toplevel` for the rationale.
-    let resolved_local =
-        resolve_local_toplevel(local_path, remote_path, &progress, "size").await?;
+    let resolved_local = resolve_local_toplevel(local_path, remote_path, &progress, "size").await?;
     let _ = progress
         .send("[size] measuring local closure …".to_string())
         .await;
@@ -354,10 +431,8 @@ pub async fn check_package_diff(
 
     // Step 1: make sure the wrapper is built, then resolve the real
     // toplevel inside it — same two-step as check_closure_sizes.
-    ensure_local_closure(flake, &node.name, profile, local_path, &progress, "pkg")
-        .await?;
-    let resolved_local =
-        resolve_local_toplevel(local_path, remote_path, &progress, "pkg").await?;
+    ensure_local_closure(flake, &node.name, profile, local_path, &progress, "pkg").await?;
+    let resolved_local = resolve_local_toplevel(local_path, remote_path, &progress, "pkg").await?;
 
     // Stage 1: list the local closure. This is a pure metadata query
     // against the local store and is essentially instantaneous.
@@ -366,9 +441,7 @@ pub async fn check_package_diff(
         .await;
     let local_paths = nix_requisites(&resolved_local)
         .await
-        .with_context(|| {
-            format!("local `nix-store --query --requisites {resolved_local}`")
-        })?;
+        .with_context(|| format!("local `nix-store --query --requisites {resolved_local}`"))?;
     let _ = progress
         .send(format!("[pkg] local closure: {} paths", local_paths.len()))
         .await;
@@ -382,9 +455,7 @@ pub async fn check_package_diff(
     let remote_cmd = format!("nix-store --query --requisites '{remote_path}'");
     let remote_out = ssh_capture(&target, &remote_cmd, override_)
         .await
-        .with_context(|| {
-            format!("remote `nix-store --query --requisites {remote_path}`")
-        })?;
+        .with_context(|| format!("remote `nix-store --query --requisites {remote_path}`"))?;
     let remote_paths: Vec<String> = remote_out
         .lines()
         .map(|s| s.trim().to_string())
@@ -423,17 +494,62 @@ pub async fn check_package_diff(
         let r = remote_by_name.get(name);
         let line = match (l, r) {
             (Some(lv), Some(rv)) if lv == rv => continue,
-            (Some(lv), Some(rv)) => format!(
-                "{name}: {} → {}",
-                join_versions(rv),
-                join_versions(lv)
-            ),
+            (Some(lv), Some(rv)) => {
+                format!("{name}: {} → {}", join_versions(rv), join_versions(lv))
+            }
             (Some(lv), None) => format!("{name}: + {}", join_versions(lv)),
             (None, Some(rv)) => format!("{name}: - {}", join_versions(rv)),
             (None, None) => continue,
         };
         let _ = progress.send(format!("[pkg] {line}")).await;
         lines.push(line);
+    }
+
+    // Stage 4: content-only diff. If every package name+version
+    // matches but the actual store-path sets still differ, the
+    // closures aren't bit-identical — typically because a config
+    // file (starship.toml, a systemd unit template, generated
+    // /etc/foo) was rebuilt with different contents. Bucketing by
+    // name swallows that signal because both sides parse to the
+    // same `<name, version>` pair. Surface it explicitly so the user
+    // doesn't read "0 changes" and conclude the deploy was a no-op.
+    if lines.is_empty() {
+        let local_set: BTreeSet<&str> = local_paths.iter().map(|s| s.as_str()).collect();
+        let remote_set: BTreeSet<&str> = remote_paths.iter().map(|s| s.as_str()).collect();
+        let only_local: Vec<&str> = local_set.difference(&remote_set).copied().collect();
+        let only_remote: Vec<&str> = remote_set.difference(&local_set).copied().collect();
+        if !only_local.is_empty() || !only_remote.is_empty() {
+            let header = format!(
+                "(content-only) {} path(s) differ — same package versions, different contents",
+                only_local.len().max(only_remote.len())
+            );
+            let _ = progress.send(format!("[pkg] {header}")).await;
+            lines.push(header);
+            // Surface up to 8 of each side so the user has a chance
+            // of recognising the culprit (e.g. a generated config
+            // file derivation) without flooding the details pane.
+            // Strip the `/nix/store/<hash>-` prefix in the snippet
+            // since it's noisy and the parsed name is what actually
+            // identifies the path.
+            for p in only_local.iter().take(8) {
+                let base = p.rsplit('/').next().unwrap_or(p);
+                let line = format!("  + {base}");
+                let _ = progress.send(format!("[pkg] {line}")).await;
+                lines.push(line);
+            }
+            for p in only_remote.iter().take(8) {
+                let base = p.rsplit('/').next().unwrap_or(p);
+                let line = format!("  - {base}");
+                let _ = progress.send(format!("[pkg] {line}")).await;
+                lines.push(line);
+            }
+            let extra = only_local.len().saturating_sub(8) + only_remote.len().saturating_sub(8);
+            if extra > 0 {
+                let line = format!("  … and {extra} more path(s)");
+                let _ = progress.send(format!("[pkg] {line}")).await;
+                lines.push(line);
+            }
+        }
     }
 
     let _ = progress
@@ -518,19 +634,13 @@ fn split_name_version(basename: &str) -> (String, String) {
     let bytes = after_hash.as_bytes();
     let mut split_at: Option<usize> = None;
     for i in 0..bytes.len() {
-        if bytes[i] == b'-'
-            && i + 1 < bytes.len()
-            && bytes[i + 1].is_ascii_digit()
-        {
+        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
             split_at = Some(i);
             break;
         }
     }
     let (mut name, mut version) = match split_at {
-        Some(i) => (
-            after_hash[..i].to_string(),
-            after_hash[i + 1..].to_string(),
-        ),
+        Some(i) => (after_hash[..i].to_string(), after_hash[i + 1..].to_string()),
         None => (after_hash.to_string(), String::new()),
     };
     for suffix in ["-activate-path", "-activate-rs"] {
@@ -688,9 +798,7 @@ async fn ensure_local_closure(
     }
     let attr = format!("{flake}#deploy.nodes.{node}.profiles.{profile}.path");
     let _ = progress
-        .send(format!(
-            "[{tag}] local closure missing, building {attr} …"
-        ))
+        .send(format!("[{tag}] local closure missing, building {attr} …"))
         .await;
     // --no-link avoids dropping a `result` symlink in the user's cwd;
     // --print-out-paths gives us the store path nix actually settled
@@ -726,7 +834,11 @@ async fn ensure_local_closure(
     // stringifies as `<outPath>/activate`, so nix build prints the
     // parent directory — the same value the caller already trimmed to.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let built: Vec<&str> = stdout.lines().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let built: Vec<&str> = stdout
+        .lines()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
     let _ = progress
         .send(format!(
             "[{tag}] built {} path(s): {}",
@@ -798,8 +910,13 @@ async fn local_profile_path(flake: &str, node: &str, profile: &str) -> Result<St
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    // deploy-rs path strings end with `/activate`; strip that to get the
-    // actual store path the remote will compare against.
+    // deploy-rs path strings end with `/activate`; strip that to get
+    // the store path of the activation *wrapper*. Note this is NOT
+    // the toplevel the remote's `/run/current-system` resolves to —
+    // the wrapper has the toplevel as one of its references and
+    // lives at a different hash. Callers that compare against the
+    // remote path need to resolve the wrapper first (see
+    // `resolve_local_toplevel` / `resolve_local_toplevel_quiet`).
     let raw = String::from_utf8(output.stdout).context("`nix eval --raw` returned non-utf8")?;
     Ok(raw.trim_end_matches("/activate").to_string())
 }
