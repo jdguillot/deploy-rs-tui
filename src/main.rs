@@ -3,20 +3,12 @@
 //! Discovers `deploy.nodes` from a Nix flake, shows host status, and runs
 //! `deploy` for the selected node/profile.
 
-mod app;
-mod deploy;
-mod event;
-mod flake;
-mod host;
-mod ssh;
-mod ui;
-
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use crate::app::App;
+use deploy_rs_tui::{app::App, flake, ui};
 
 /// CLI arguments. The TUI runs against a single flake reference.
 #[derive(Debug, Parser)]

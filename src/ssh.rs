@@ -109,3 +109,116 @@ impl SshOverride {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn default_is_inactive() {
+        let o = SshOverride::default();
+        assert!(!o.is_active());
+    }
+
+    #[test]
+    fn any_field_makes_active() {
+        let cases = vec![
+            SshOverride { hostname: Some("h".into()), ..Default::default() },
+            SshOverride { user: Some("u".into()), ..Default::default() },
+            SshOverride { identity: Some(PathBuf::from("/k")), ..Default::default() },
+            SshOverride { extra_opts: Some("Port=22".into()), ..Default::default() },
+        ];
+        for o in cases {
+            assert!(o.is_active(), "expected active for {o:?}");
+        }
+    }
+
+    #[test]
+    fn effective_host_prefers_override() {
+        let o = SshOverride { hostname: Some("10.0.0.1".into()), ..Default::default() };
+        assert_eq!(o.effective_host("fallback.example.com"), "10.0.0.1");
+    }
+
+    #[test]
+    fn effective_host_falls_back() {
+        let o = SshOverride::default();
+        assert_eq!(o.effective_host("fallback.example.com"), "fallback.example.com");
+    }
+
+    #[test]
+    fn effective_user_priority() {
+        // Override wins over fallback.
+        let o = SshOverride { user: Some("admin".into()), ..Default::default() };
+        assert_eq!(o.effective_user(Some("root")), Some("admin"));
+
+        // No override → fallback.
+        let o = SshOverride::default();
+        assert_eq!(o.effective_user(Some("root")), Some("root"));
+
+        // Neither → None.
+        let o = SshOverride::default();
+        assert_eq!(o.effective_user(None), None);
+    }
+
+    #[test]
+    fn ssh_args_empty_when_no_overrides() {
+        let o = SshOverride::default();
+        assert!(o.ssh_args().is_empty());
+    }
+
+    #[test]
+    fn ssh_args_identity_and_opts() {
+        let o = SshOverride {
+            identity: Some(PathBuf::from("/home/me/.ssh/id_ed25519")),
+            extra_opts: Some("Port=2222 ProxyJump=bastion".into()),
+            ..Default::default()
+        };
+        let args = o.ssh_args();
+        assert_eq!(
+            args,
+            vec![
+                "-i", "/home/me/.ssh/id_ed25519",
+                "-o", "Port=2222",
+                "-o", "ProxyJump=bastion",
+            ]
+        );
+    }
+
+    #[test]
+    fn deploy_ssh_opts_none_when_empty() {
+        let o = SshOverride::default();
+        assert_eq!(o.deploy_ssh_opts(), None);
+    }
+
+    #[test]
+    fn deploy_ssh_opts_joins_all() {
+        let o = SshOverride {
+            identity: Some(PathBuf::from("/k")),
+            extra_opts: Some("Port=22".into()),
+            ..Default::default()
+        };
+        assert_eq!(o.deploy_ssh_opts(), Some("-i /k -o Port=22".into()));
+    }
+
+    #[test]
+    fn summary_none_when_empty() {
+        let o = SshOverride::default();
+        assert_eq!(o.summary(), "(none)");
+    }
+
+    #[test]
+    fn summary_shows_all_fields() {
+        let o = SshOverride {
+            hostname: Some("10.0.0.1".into()),
+            user: Some("admin".into()),
+            identity: Some(PathBuf::from("/k")),
+            extra_opts: Some("Port=22".into()),
+        };
+        let s = o.summary();
+        assert!(s.contains("host=10.0.0.1"), "{s}");
+        assert!(s.contains("user=admin"), "{s}");
+        assert!(s.contains("key=/k"), "{s}");
+        assert!(s.contains("opts=Port=22"), "{s}");
+    }
+}

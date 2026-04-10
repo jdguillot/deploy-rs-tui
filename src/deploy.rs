@@ -321,7 +321,79 @@ fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_ansi;
+    use super::*;
+
+    // ---- ProfileSel ----
+
+    #[test]
+    fn target_suffix_all() {
+        assert_eq!(ProfileSel::All.target_suffix(), "");
+    }
+
+    #[test]
+    fn target_suffix_system() {
+        assert_eq!(ProfileSel::System.target_suffix(), ".system");
+    }
+
+    #[test]
+    fn target_suffix_home() {
+        assert_eq!(ProfileSel::Home.target_suffix(), ".home");
+    }
+
+    // ---- DeployRequest::target ----
+
+    #[test]
+    fn deploy_target_all_profiles() {
+        let req = DeployRequest {
+            flake: "/home/me/dotfiles".into(),
+            node: "myhost".into(),
+            profile: ProfileSel::All,
+            mode: Mode::Switch,
+            toggles: Toggles::default(),
+            ssh_override: SshOverride::default(),
+        };
+        assert_eq!(req.target(), "/home/me/dotfiles#myhost");
+    }
+
+    #[test]
+    fn deploy_target_system_only() {
+        let req = DeployRequest {
+            flake: ".".into(),
+            node: "server1".into(),
+            profile: ProfileSel::System,
+            mode: Mode::Boot,
+            toggles: Toggles::default(),
+            ssh_override: SshOverride::default(),
+        };
+        assert_eq!(req.target(), ".#server1.system");
+    }
+
+    #[test]
+    fn deploy_target_home_only() {
+        let req = DeployRequest {
+            flake: "github:me/dotfiles".into(),
+            node: "laptop".into(),
+            profile: ProfileSel::Home,
+            mode: Mode::DryRun,
+            toggles: Toggles::default(),
+            ssh_override: SshOverride::default(),
+        };
+        assert_eq!(req.target(), "github:me/dotfiles#laptop.home");
+    }
+
+    // ---- Toggles ----
+
+    #[test]
+    fn toggles_default_matches_deploy_rs() {
+        let t = Toggles::default();
+        assert!(!t.skip_checks);
+        assert!(t.magic_rollback);
+        assert!(t.auto_rollback);
+        assert!(!t.remote_build);
+        assert!(!t.interactive_sudo);
+    }
+
+    // ---- strip_ansi (existing + new) ----
 
     #[test]
     fn strips_csi_color_sequences() {

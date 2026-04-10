@@ -24,10 +24,42 @@ All of these assume you're inside the dev shell (`nix develop`) so that
 | format                | `cargo fmt`                                   |
 | nix build             | `nix build`                                   |
 
-Tests live in `deploy.rs` (ANSI-stripping unit tests). When adding more,
-prefer integration-style tests that mock `nix` / `deploy` / `ssh` via
-`PATH` shims rather than unit tests over the wrapper functions — the
-wrapper functions are very thin.
+| test (all)            | `cargo test`                                  |
+| test (unit only)      | `cargo test --lib`                             |
+| test (integration)    | `cargo test --test '*'`                        |
+
+### Test suite
+
+**Unit tests** (`cargo test --lib`, ~80 tests) live inside `#[cfg(test)]`
+blocks in the source modules:
+
+- `ssh.rs` — `SshOverride` accessors, `ssh_args`, `deploy_ssh_opts`,
+  `summary`.
+- `host.rs` — `split_name_version`, `parsed_paths_equivalent`,
+  `compute_version_diff`, `bucket_paths_by_name`, `join_versions`,
+  `parse_closure_size`, `build_ssh_target`.
+- `deploy.rs` — `strip_ansi`, `ProfileSel::target_suffix`,
+  `DeployRequest::target`, `Toggles::default`.
+- `flake.rs` — `Node::has_system`, `Node::has_home`, JSON deserialisation.
+- `app.rs` — `App::new` defaults, key handling (quit, navigation,
+  toggles, mode selection, help popup), `push_log` cap, override
+  management, `FocusPane` layout rows.
+
+**Integration tests** (`tests/`, ~12 tests) exercise the process-spawning
+code paths via shell-script PATH shims (no real `nix`/`deploy`/`ssh`
+required):
+
+- `tests/flake_discover.rs` — mock `nix` binary returns canned JSON;
+  covers success, empty nodes, eval failure, and malformed JSON.
+- `tests/deploy_run.rs` — mock `deploy` binary; covers stdout/stderr
+  streaming, exit code propagation, mode flags (`--boot`,
+  `--dry-activate`), toggle flags, SSH override flags, ANSI stripping,
+  and profile suffix in the target string.
+
+Integration tests use `serial_test` to serialize because they mutate the
+process-global `$PATH`. When adding more, follow the same pattern:
+install a shim, mark `#[serial]`, keep the `TempDir` alive for the test
+duration.
 
 ## Architecture
 

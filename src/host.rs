@@ -468,17 +468,28 @@ pub async fn check_package_diff(
         ))
         .await;
 
-    // Stage 3: bucket each side by parsed package name → version set,
-    // then walk the union of names and emit a line for any name whose
-    // version differs (or where the package is only present on one
-    // side). Names that match exactly produce no output, so the diff
-    // length is the count of *real changes* — what the user wants to
-    // see.
     let _ = progress
         .send("[pkg] computing version diff …".to_string())
         .await;
-    let local_by_name = bucket_paths_by_name(&local_paths);
-    let remote_by_name = bucket_paths_by_name(&remote_paths);
+    let lines = compute_version_diff(&local_paths, &remote_paths);
+    for line in &lines {
+        let _ = progress.send(format!("[pkg] {line}")).await;
+    }
+    let _ = progress
+        .send(format!("[pkg] done ({} change(s))", lines.len()))
+        .await;
+    Ok(lines.join("\n"))
+}
+
+/// Pure-logic version + content diff between two closure path lists.
+///
+/// Buckets each side by parsed `<name, version>`, walks the union, and
+/// emits one line per name whose version set differs. When no version
+/// changes exist but the store-path sets still diverge (config-file
+/// rebuilds), emits a `(content-only)` summary with sample basenames.
+fn compute_version_diff(local_paths: &[String], remote_paths: &[String]) -> Vec<String> {
+    let local_by_name = bucket_paths_by_name(local_paths);
+    let remote_by_name = bucket_paths_by_name(remote_paths);
 
     let mut all_names: BTreeSet<&str> = BTreeSet::new();
     for k in local_by_name.keys() {
@@ -489,9 +500,9 @@ pub async fn check_package_diff(
     }
 
     let mut lines = Vec::<String>::new();
-    for name in all_names {
-        let l = local_by_name.get(name);
-        let r = remote_by_name.get(name);
+    for name in &all_names {
+        let l = local_by_name.get(*name);
+        let r = remote_by_name.get(*name);
         let line = match (l, r) {
             (Some(lv), Some(rv)) if lv == rv => continue,
             (Some(lv), Some(rv)) => {
@@ -501,61 +512,36 @@ pub async fn check_package_diff(
             (None, Some(rv)) => format!("{name}: - {}", join_versions(rv)),
             (None, None) => continue,
         };
-        let _ = progress.send(format!("[pkg] {line}")).await;
         lines.push(line);
     }
 
-    // Stage 4: content-only diff. If every package name+version
-    // matches but the actual store-path sets still differ, the
-    // closures aren't bit-identical — typically because a config
-    // file (starship.toml, a systemd unit template, generated
-    // /etc/foo) was rebuilt with different contents. Bucketing by
-    // name swallows that signal because both sides parse to the
-    // same `<name, version>` pair. Surface it explicitly so the user
-    // doesn't read "0 changes" and conclude the deploy was a no-op.
+    // Content-only diff: every package name+version matches but the
+    // actual store-path sets still differ (config-file rebuilds).
     if lines.is_empty() {
         let local_set: BTreeSet<&str> = local_paths.iter().map(|s| s.as_str()).collect();
         let remote_set: BTreeSet<&str> = remote_paths.iter().map(|s| s.as_str()).collect();
         let only_local: Vec<&str> = local_set.difference(&remote_set).copied().collect();
         let only_remote: Vec<&str> = remote_set.difference(&local_set).copied().collect();
         if !only_local.is_empty() || !only_remote.is_empty() {
-            let header = format!(
+            lines.push(format!(
                 "(content-only) {} path(s) differ — same package versions, different contents",
                 only_local.len().max(only_remote.len())
-            );
-            let _ = progress.send(format!("[pkg] {header}")).await;
-            lines.push(header);
-            // Surface up to 8 of each side so the user has a chance
-            // of recognising the culprit (e.g. a generated config
-            // file derivation) without flooding the details pane.
-            // Strip the `/nix/store/<hash>-` prefix in the snippet
-            // since it's noisy and the parsed name is what actually
-            // identifies the path.
+            ));
             for p in only_local.iter().take(8) {
                 let base = p.rsplit('/').next().unwrap_or(p);
-                let line = format!("  + {base}");
-                let _ = progress.send(format!("[pkg] {line}")).await;
-                lines.push(line);
+                lines.push(format!("  + {base}"));
             }
             for p in only_remote.iter().take(8) {
                 let base = p.rsplit('/').next().unwrap_or(p);
-                let line = format!("  - {base}");
-                let _ = progress.send(format!("[pkg] {line}")).await;
-                lines.push(line);
+                lines.push(format!("  - {base}"));
             }
             let extra = only_local.len().saturating_sub(8) + only_remote.len().saturating_sub(8);
             if extra > 0 {
-                let line = format!("  … and {extra} more path(s)");
-                let _ = progress.send(format!("[pkg] {line}")).await;
-                lines.push(line);
+                lines.push(format!("  … and {extra} more path(s)"));
             }
         }
     }
-
-    let _ = progress
-        .send(format!("[pkg] done ({} change(s))", lines.len()))
-        .await;
-    Ok(lines.join("\n"))
+    lines
 }
 
 /// Run `nix-store --query --requisites <path>` against the local
@@ -919,6 +905,291 @@ async fn local_profile_path(flake: &str, node: &str, profile: &str) -> Result<St
     // `resolve_local_toplevel` / `resolve_local_toplevel_quiet`).
     let raw = String::from_utf8(output.stdout).context("`nix eval --raw` returned non-utf8")?;
     Ok(raw.trim_end_matches("/activate").to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    // ---- split_name_version ----
+
+    #[test]
+    fn split_basic_package() {
+        let (name, ver) = split_name_version("abc123-openssl-3.5.1");
+        assert_eq!(name, "openssl");
+        assert_eq!(ver, "3.5.1");
+    }
+
+    #[test]
+    fn split_no_version() {
+        let (name, ver) = split_name_version("abc123-system-path");
+        assert_eq!(name, "system-path");
+        assert_eq!(ver, "");
+    }
+
+    #[test]
+    fn split_nixos_system_with_activate_suffix() {
+        // deploy-rs wrapper path
+        let (name, ver) =
+            split_name_version("abc123-nixos-system-myhost-26.05.20260405.68d8aa3-activate-path");
+        assert_eq!(name, "nixos-system-myhost-activate-path");
+        assert_eq!(ver, "26.05.20260405.68d8aa3");
+    }
+
+    #[test]
+    fn split_activate_rs_suffix() {
+        let (name, ver) =
+            split_name_version("abc123-nixos-system-myhost-26.05.12345-activate-rs");
+        assert_eq!(name, "nixos-system-myhost-activate-rs");
+        assert_eq!(ver, "26.05.12345");
+    }
+
+    #[test]
+    fn split_linux_modules() {
+        let (name, ver) = split_name_version("abc123-linux-6.6.114-modules");
+        assert_eq!(name, "linux");
+        assert_eq!(ver, "6.6.114-modules");
+    }
+
+    #[test]
+    fn split_python_package() {
+        let (name, ver) = split_name_version("abc123-python3.11-pip-24.0");
+        assert_eq!(name, "python3.11-pip");
+        assert_eq!(ver, "24.0");
+    }
+
+    #[test]
+    fn split_bash_patch() {
+        let (name, ver) = split_name_version("abc123-bash-5.2-p37");
+        assert_eq!(name, "bash");
+        assert_eq!(ver, "5.2-p37");
+    }
+
+    #[test]
+    fn split_no_hash_separator() {
+        let (name, ver) = split_name_version("nohash");
+        assert_eq!(name, "nohash");
+        assert_eq!(ver, "");
+    }
+
+    // ---- parsed_paths_equivalent ----
+
+    #[test]
+    fn equivalent_same_toplevel() {
+        assert!(parsed_paths_equivalent(
+            "/nix/store/abc123-nixos-system-host-26.05.12345",
+            "/nix/store/abc123-nixos-system-host-26.05.12345",
+        ));
+    }
+
+    #[test]
+    fn equivalent_wrapper_vs_toplevel() {
+        // Wrapper has -activate-path suffix; the function should peel it.
+        assert!(parsed_paths_equivalent(
+            "/nix/store/xyz-nixos-system-host-26.05.12345-activate-path",
+            "/nix/store/abc-nixos-system-host-26.05.12345",
+        ));
+    }
+
+    #[test]
+    fn not_equivalent_different_versions() {
+        assert!(!parsed_paths_equivalent(
+            "/nix/store/abc-nixos-system-host-26.05.11111",
+            "/nix/store/abc-nixos-system-host-26.05.22222",
+        ));
+    }
+
+    // ---- parse_closure_size ----
+
+    #[test]
+    fn parse_closure_size_normal() {
+        let input = "/nix/store/abc-foo\t1234567890\n";
+        assert_eq!(parse_closure_size(input), Some(1234567890));
+    }
+
+    #[test]
+    fn parse_closure_size_spaces() {
+        let input = "/nix/store/abc-foo   999\n";
+        assert_eq!(parse_closure_size(input), Some(999));
+    }
+
+    #[test]
+    fn parse_closure_size_empty() {
+        assert_eq!(parse_closure_size(""), None);
+    }
+
+    #[test]
+    fn parse_closure_size_no_number() {
+        assert_eq!(parse_closure_size("garbage"), None);
+    }
+
+    // ---- join_versions ----
+
+    #[test]
+    fn join_versions_single() {
+        let mut s = BTreeSet::new();
+        s.insert("3.5.1".to_string());
+        assert_eq!(join_versions(&s), "3.5.1");
+    }
+
+    #[test]
+    fn join_versions_empty_version() {
+        let mut s = BTreeSet::new();
+        s.insert(String::new());
+        assert_eq!(join_versions(&s), "(no version)");
+    }
+
+    #[test]
+    fn join_versions_multiple() {
+        let mut s = BTreeSet::new();
+        s.insert("1.0".to_string());
+        s.insert("2.0".to_string());
+        assert_eq!(join_versions(&s), "1.0, 2.0");
+    }
+
+    // ---- bucket_paths_by_name ----
+
+    #[test]
+    fn bucket_groups_by_name() {
+        let paths = vec![
+            "/nix/store/aaa-openssl-3.5.1".to_string(),
+            "/nix/store/bbb-openssl-3.5.2".to_string(),
+            "/nix/store/ccc-bash-5.2".to_string(),
+        ];
+        let map = bucket_paths_by_name(&paths);
+        assert_eq!(map.len(), 2);
+        let openssl = map.get("openssl").unwrap();
+        assert!(openssl.contains("3.5.1"));
+        assert!(openssl.contains("3.5.2"));
+        let bash = map.get("bash").unwrap();
+        assert!(bash.contains("5.2"));
+    }
+
+    // ---- compute_version_diff ----
+
+    #[test]
+    fn diff_identical_closures() {
+        let paths = vec![
+            "/nix/store/aaa-openssl-3.5.1".to_string(),
+            "/nix/store/bbb-bash-5.2".to_string(),
+        ];
+        let lines = compute_version_diff(&paths, &paths);
+        assert!(lines.is_empty(), "identical closures should have no diff");
+    }
+
+    #[test]
+    fn diff_version_update() {
+        let local = vec!["/nix/store/aaa-openssl-3.5.2".to_string()];
+        let remote = vec!["/nix/store/bbb-openssl-3.5.1".to_string()];
+        let lines = compute_version_diff(&local, &remote);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("openssl"), "{}", lines[0]);
+        assert!(lines[0].contains("3.5.1"), "{}", lines[0]);
+        assert!(lines[0].contains("3.5.2"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn diff_added_package() {
+        let local = vec![
+            "/nix/store/aaa-openssl-3.5.1".to_string(),
+            "/nix/store/bbb-curl-8.0".to_string(),
+        ];
+        let remote = vec!["/nix/store/ccc-openssl-3.5.1".to_string()];
+        let lines = compute_version_diff(&local, &remote);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("curl"), "{}", lines[0]);
+        assert!(lines[0].starts_with("curl: +"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn diff_removed_package() {
+        let local = vec!["/nix/store/aaa-openssl-3.5.1".to_string()];
+        let remote = vec![
+            "/nix/store/bbb-openssl-3.5.1".to_string(),
+            "/nix/store/ccc-curl-8.0".to_string(),
+        ];
+        let lines = compute_version_diff(&local, &remote);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("curl"), "{}", lines[0]);
+        assert!(lines[0].starts_with("curl: -"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn diff_content_only_change() {
+        // Same name+version but different store hashes → content-only.
+        let local = vec!["/nix/store/aaa-openssl-3.5.1".to_string()];
+        let remote = vec!["/nix/store/bbb-openssl-3.5.1".to_string()];
+        let lines = compute_version_diff(&local, &remote);
+        assert!(!lines.is_empty());
+        assert!(
+            lines[0].contains("(content-only)"),
+            "expected content-only marker, got: {}",
+            lines[0]
+        );
+    }
+
+    // ---- build_ssh_target ----
+
+    #[test]
+    fn build_ssh_target_no_override() {
+        let node = Node {
+            name: "myhost".into(),
+            hostname: "myhost.example.com".into(),
+            ssh_user: Some("root".into()),
+            profiles: BTreeMap::new(),
+        };
+        let o = SshOverride::default();
+        assert_eq!(build_ssh_target(&node, "system", &o), "root@myhost.example.com");
+    }
+
+    #[test]
+    fn build_ssh_target_with_override() {
+        let node = Node {
+            name: "myhost".into(),
+            hostname: "myhost.example.com".into(),
+            ssh_user: Some("root".into()),
+            profiles: BTreeMap::new(),
+        };
+        let o = SshOverride {
+            hostname: Some("10.0.0.5".into()),
+            user: Some("admin".into()),
+            ..Default::default()
+        };
+        assert_eq!(build_ssh_target(&node, "system", &o), "admin@10.0.0.5");
+    }
+
+    #[test]
+    fn build_ssh_target_no_user() {
+        let node = Node {
+            name: "myhost".into(),
+            hostname: "myhost.example.com".into(),
+            ssh_user: None,
+            profiles: BTreeMap::new(),
+        };
+        let o = SshOverride::default();
+        // No user at all → bare hostname.
+        assert_eq!(build_ssh_target(&node, "system", &o), "myhost.example.com");
+    }
+
+    #[test]
+    fn build_ssh_target_home_profile_user() {
+        use crate::flake::Profile;
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "home".into(),
+            Profile { user: Some("jd".into()) },
+        );
+        let node = Node {
+            name: "myhost".into(),
+            hostname: "myhost.example.com".into(),
+            ssh_user: None,
+            profiles,
+        };
+        let o = SshOverride::default();
+        // Home profile should use its own user.
+        assert_eq!(build_ssh_target(&node, "home", &o), "jd@myhost.example.com");
+    }
 }
 
 /// Run a non-interactive ssh command and return its stdout. Errors include

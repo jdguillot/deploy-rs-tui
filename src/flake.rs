@@ -49,6 +49,103 @@ impl Node {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn has_system_true() {
+        let mut profiles = BTreeMap::new();
+        profiles.insert("system".into(), Profile { user: None });
+        let node = Node {
+            name: "host".into(),
+            hostname: "host".into(),
+            ssh_user: None,
+            profiles,
+        };
+        assert!(node.has_system());
+        assert!(!node.has_home());
+    }
+
+    #[test]
+    fn has_home_true() {
+        let mut profiles = BTreeMap::new();
+        profiles.insert("home".into(), Profile { user: Some("jd".into()) });
+        let node = Node {
+            name: "host".into(),
+            hostname: "host".into(),
+            ssh_user: None,
+            profiles,
+        };
+        assert!(!node.has_system());
+        assert!(node.has_home());
+    }
+
+    #[test]
+    fn has_both() {
+        let mut profiles = BTreeMap::new();
+        profiles.insert("system".into(), Profile { user: None });
+        profiles.insert("home".into(), Profile { user: Some("jd".into()) });
+        let node = Node {
+            name: "host".into(),
+            hostname: "host".into(),
+            ssh_user: None,
+            profiles,
+        };
+        assert!(node.has_system());
+        assert!(node.has_home());
+    }
+
+    #[test]
+    fn deserialize_node_json() {
+        let json = r#"{
+            "hostname": "myhost.example.com",
+            "sshUser": "root",
+            "profiles": {
+                "system": { "user": null },
+                "home": { "user": "jd" }
+            }
+        }"#;
+        let node: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(node.hostname, "myhost.example.com");
+        assert_eq!(node.ssh_user.as_deref(), Some("root"));
+        assert!(node.has_system());
+        assert!(node.has_home());
+        assert_eq!(
+            node.profiles.get("home").unwrap().user.as_deref(),
+            Some("jd")
+        );
+        // name is skip(deserializing) so it stays empty.
+        assert!(node.name.is_empty());
+    }
+
+    #[test]
+    fn deserialize_minimal_node() {
+        let json = r#"{ "hostname": "h" }"#;
+        let node: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(node.hostname, "h");
+        assert_eq!(node.ssh_user, None);
+        assert!(node.profiles.is_empty());
+    }
+
+    #[test]
+    fn deserialize_nodes_map() {
+        let json = r#"{
+            "alpha": { "hostname": "alpha.lan" },
+            "beta":  { "hostname": "beta.lan", "sshUser": "root", "profiles": { "system": {} } }
+        }"#;
+        let raw: BTreeMap<String, Node> = serde_json::from_str(json).unwrap();
+        let nodes: Vec<Node> = raw
+            .into_iter()
+            .map(|(name, mut node)| { node.name = name; node })
+            .collect();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].name, "alpha");
+        assert_eq!(nodes[1].name, "beta");
+        assert!(nodes[1].has_system());
+    }
+}
+
 /// Run `nix eval --json` on the flake and parse the resulting attrset.
 pub async fn discover(flake: &str) -> Result<Vec<Node>> {
     // Apply function strips the heavy `path` derivations and keeps only the

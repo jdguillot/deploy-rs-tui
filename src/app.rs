@@ -2515,3 +2515,262 @@ fn describe_profile(p: ProfileSel) -> &'static str {
         ProfileSel::Home => "home",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use crate::flake::{Node, Profile};
+
+    fn sample_nodes() -> Vec<Node> {
+        let mut profiles = BTreeMap::new();
+        profiles.insert("system".into(), Profile { user: None });
+        profiles.insert("home".into(), Profile { user: Some("jd".into()) });
+        vec![
+            Node {
+                name: "alpha".into(),
+                hostname: "alpha.lan".into(),
+                ssh_user: Some("root".into()),
+                profiles: profiles.clone(),
+            },
+            Node {
+                name: "beta".into(),
+                hostname: "beta.lan".into(),
+                ssh_user: None,
+                profiles: {
+                    let mut p = BTreeMap::new();
+                    p.insert("system".into(), Profile { user: None });
+                    p
+                },
+            },
+            Node {
+                name: "gamma".into(),
+                hostname: "gamma.lan".into(),
+                ssh_user: None,
+                profiles: BTreeMap::new(),
+            },
+        ]
+    }
+
+    #[test]
+    fn new_app_initialises_status_for_every_node() {
+        let nodes = sample_nodes();
+        let app = App::new(".".into(), nodes.clone());
+        assert_eq!(app.status.len(), nodes.len());
+        for n in &nodes {
+            assert!(app.status.contains_key(&n.name));
+        }
+    }
+
+    #[test]
+    fn new_app_defaults() {
+        let app = App::new(".".into(), sample_nodes());
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.mode, Mode::Switch);
+        assert_eq!(app.profile_sel, ProfileSel::All);
+        assert!(app.marked.is_empty());
+        assert_eq!(app.focus, FocusPane::Hosts);
+        assert!(!app.show_help);
+        assert!(app.log.is_empty());
+        assert!(app.deploy_rx.is_none());
+        assert!(app.last_deploy.is_none());
+    }
+
+    #[test]
+    fn selected_node_returns_correct_node() {
+        let app = App::new(".".into(), sample_nodes());
+        assert_eq!(app.selected_node().unwrap().name, "alpha");
+    }
+
+    #[test]
+    fn selected_node_none_for_empty() {
+        let app = App::new(".".into(), Vec::new());
+        assert!(app.selected_node().is_none());
+    }
+
+    #[test]
+    fn is_marked_works() {
+        let mut app = App::new(".".into(), sample_nodes());
+        assert!(!app.is_marked("alpha"));
+        app.marked.push("alpha".into());
+        assert!(app.is_marked("alpha"));
+        assert!(!app.is_marked("beta"));
+    }
+
+    #[test]
+    fn status_for_returns_default_for_unknown() {
+        let app = App::new(".".into(), sample_nodes());
+        let st = app.status_for("nonexistent");
+        assert_eq!(st.reachability, Reachability::Unknown);
+        assert_eq!(st.system_update, UpdateState::Unknown);
+    }
+
+    #[test]
+    fn override_for_returns_empty_by_default() {
+        let app = App::new(".".into(), sample_nodes());
+        let o = app.override_for("alpha");
+        assert!(!o.is_active());
+    }
+
+    #[test]
+    fn override_mut_creates_entry() {
+        let mut app = App::new(".".into(), sample_nodes());
+        assert!(!app.overrides.contains_key("alpha"));
+        app.override_mut("alpha").hostname = Some("10.0.0.1".into());
+        assert!(app.overrides.contains_key("alpha"));
+        assert!(app.override_for("alpha").is_active());
+    }
+
+    #[test]
+    fn push_log_caps_at_2000() {
+        let mut app = App::new(".".into(), sample_nodes());
+        for i in 0..2100 {
+            app.push_log(&format!("line {i}"), false);
+        }
+        assert_eq!(app.log.len(), 2000);
+        // Most recent line should still be present.
+        assert_eq!(app.log.last().unwrap().text, "line 2099");
+        // Oldest lines should have been drained.
+        assert_eq!(app.log.first().unwrap().text, "line 100");
+    }
+
+    #[test]
+    fn push_log_tagged_sets_host() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.push_log_tagged("deploying", false, Some("alpha".into()));
+        assert_eq!(app.log[0].host.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn toggles_start_at_deploy_rs_defaults() {
+        let app = App::new(".".into(), sample_nodes());
+        assert!(!app.toggles.skip_checks);
+        assert!(app.toggles.magic_rollback);
+        assert!(app.toggles.auto_rollback);
+        assert!(!app.toggles.remote_build);
+        assert!(!app.toggles.interactive_sudo);
+    }
+
+    #[test]
+    fn describe_mode_labels() {
+        assert_eq!(describe_mode(Mode::Switch), "switch");
+        assert_eq!(describe_mode(Mode::Boot), "boot");
+        assert_eq!(describe_mode(Mode::DryRun), "dry-run");
+    }
+
+    #[test]
+    fn describe_profile_labels() {
+        assert_eq!(describe_profile(ProfileSel::All), "all");
+        assert_eq!(describe_profile(ProfileSel::System), "system");
+        assert_eq!(describe_profile(ProfileSel::Home), "home");
+    }
+
+    #[test]
+    fn focus_pane_rows() {
+        assert_eq!(FocusPane::Toggles.row(), 0);
+        assert_eq!(FocusPane::Hosts.row(), 1);
+        assert_eq!(FocusPane::Details.row(), 1);
+        assert_eq!(FocusPane::JobLog.row(), 1);
+        assert_eq!(FocusPane::Commands.row(), 2);
+    }
+
+    #[test]
+    fn command_pane_entries() {
+        // Smoke test: at least verify the pane has the expected commands
+        // and that indices match expectations for the nav cursor.
+        assert!(COMMANDS.len() >= 10);
+        assert_eq!(COMMANDS[0].0, Command::Refresh);
+        assert_eq!(COMMANDS[0].1, "r");
+    }
+
+    #[test]
+    fn handle_key_ctrl_c_quits() {
+        let mut app = App::new(".".into(), sample_nodes());
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.handle_key(key);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn handle_key_q_quits() {
+        let mut app = App::new(".".into(), sample_nodes());
+        let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        app.handle_key(key);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn handle_key_question_mark_toggles_help() {
+        let mut app = App::new(".".into(), sample_nodes());
+        assert!(!app.show_help);
+        let key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        app.handle_key(key);
+        assert!(app.show_help);
+    }
+
+    #[test]
+    fn handle_key_j_k_moves_selection() {
+        let mut app = App::new(".".into(), sample_nodes());
+        assert_eq!(app.selected, 0);
+
+        // j moves down.
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.selected, 1);
+
+        // k moves up.
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.selected, 0);
+
+        // k at top wraps to bottom.
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.selected, 2);
+    }
+
+    #[test]
+    fn handle_key_mode_selection() {
+        let mut app = App::new(".".into(), sample_nodes());
+        // Profile selection keys.
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(app.profile_sel, ProfileSel::All);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.profile_sel, ProfileSel::System);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.profile_sel, ProfileSel::Home);
+    }
+
+    #[test]
+    fn handle_key_toggle_skip_checks() {
+        let mut app = App::new(".".into(), sample_nodes());
+        assert!(!app.toggles.skip_checks);
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert!(app.toggles.skip_checks);
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert!(!app.toggles.skip_checks);
+    }
+
+    #[test]
+    fn handle_key_toggle_magic_rollback() {
+        let mut app = App::new(".".into(), sample_nodes());
+        assert!(app.toggles.magic_rollback);
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(!app.toggles.magic_rollback);
+    }
+
+    #[test]
+    fn handle_key_tab_cycles_focus() {
+        let mut app = App::new(".".into(), sample_nodes());
+        assert_eq!(app.focus, FocusPane::Hosts);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        // Tab should move focus (exact target depends on layout logic,
+        // but it should NOT stay on Hosts).
+        assert_ne!(app.focus, FocusPane::Hosts);
+    }
+
+    #[test]
+    fn input_mode_starts_normal() {
+        let app = App::new(".".into(), sample_nodes());
+        assert!(matches!(app.input, InputMode::Normal));
+    }
+}
